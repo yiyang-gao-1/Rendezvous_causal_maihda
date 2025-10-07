@@ -1,255 +1,186 @@
 ---
-title: "ACIC 2022 Track 1 (Patient–Year) — Data Structure and Merge Guide"
+title: "ACIC 2022 Track 1 (Patient–Year) Data Structure and Merge Guide"
 author: "Yiyang Gao"
 date: "`r format(Sys.time(), '%Y-%m-%d')`"
 output:
+  pdf_document:
+    toc: true
+    number_sections: true
   html_document:
     toc: true
     toc_depth: 3
     df_print: paged
-  pdf_document:
-    toc: true
-    number_sections: true
 params:
-  data_dir: "path/to/track1"
-  replicate_id: "0001"   # four-digit string: 0001–1200
+  data_dir: "/Users/constanceko/Desktop/MAIHDA/ACIC_track1a_20220404"  # set your base path
+  replicate_id: "0001"   # valid range: 0001–3400
 ---
 
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(message = FALSE, warning = FALSE)
-# Load required libraries
-library(dplyr)
-library(readr)
-library(stringr)
-library(lme4)
-library(knitr)
-library(kableExtra)
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(readr)
+  library(fs)
+  library(glue)
+})
 ```
 
 # 1. The Four Core Files (Structure and Meaning)
 
-**Track 1** consists of four CSV files per replicate (e.g., `xxxx = 0001, replicates range from 0001 to 1200`):
+**Track 1** provides four CSVs per replicate (e.g., `xxxx = 0001`, replicates range **0001–1200**; files are split across zip parts a/b/c):
 
-+--------------------------+------------------------------+-----------------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
-| File                     | Level (Uniqueness)           | Key(s)                | Main Contents                                                                                                                                                                                                                                                                   |
-+==========================+==============================+=======================+=================================================================================================================================================================================================================================================================================+
-| `patient_xxxx.csv`       | Patient (time-invariant)     | `id.patient`          | One row per patient. Patient covariates **V1–V5** and the clinic identifier **id.practice**.                                                                                                                                                                                    |
-+--------------------------+------------------------------+-----------------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
-| `patient_year_xxxx.csv`  | Patient–Year (time-varying)  | `id.patient`, `year`  | One row per patient per year. Outcome **Y** is the patient’s *monthly average medical expenditure* for that year.                                                                                                                                                               |
-|                          |                              |                       |                                                                                                                                                                                                                                                                                 |
-|                          |                              |                       | Not all patients appear in all years (aging in/out or death); absence is **not** missingness to impute.                                                                                                                                                                         |
-+--------------------------+------------------------------+-----------------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
-| `practice_xxxx.csv`      | Practice (time-invariant)    | `id.practice`         | One row per practice. Practice covariates **X1–X9**.                                                                                                                                                                                                                            |
-+--------------------------+------------------------------+-----------------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
-| `practice_year_xxxx.csv` | Practice–Year (time-varying) | `id.practice`, `year` | One row per practice per year. Contains **Z** (treatment indicator), **post** (post-period indicator), practice-year aggregates (e.g., **V1_C–V5_C** or `_avg`), **n.patients**, and a practice-level average **Y** (note: do **not** use this Y for Track 1 outcome modeling). |
-+--------------------------+------------------------------+-----------------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| File | Level (Uniqueness) | Key(s) | Main contents |
+|---------------|---------------|---------------|---------------------------|
+| `patient_xxxx.csv` | Patient (time-invariant) | `id.patient` | One row per patient. Patient covariates **V1–V5** and clinic ID **id.practice**. |
+| `patient_year_xxxx.csv` | Patient–Year (time-varying) | `id.patient`, `year` | One row per patient per year. Outcome **Y** = monthly average medical expenditure for that year. Patients do **not** appear in all years by design (aging in/out, death). |
+| `practice_xxxx.csv` | Practice (time-invariant) | `id.practice` | One row per practice. Practice covariates **X1–X9**. |
+| `practice_year_xxxx.csv` | Practice–Year (time-varying) | `id.practice`, `year` | One row per practice per year: **Z** (treatment), **post** (post period), **n.patients**, practice-year aggregates (e.g., **V1_C–V5_C** or **V1_avg–V5_avg**), and a practice-level **Y** (drop this for Track-1 outcome modeling). |
 
-> **Outcome to use in Track 1**: keep **patient-level `Y`** from `patient_year_xxxx.csv`; drop practice-level `Y` from `practice_year_xxxx.csv`.
+> **Track-1 outcome:** keep **patient-level `Y`** from `patient_year_xxxx.csv`; **drop** the practice-level `Y` from `practice_year_xxxx.csv`.
 
 # 2. Hierarchical Relationships
 
-Patients are **nested in** practices, and both patients and practices vary over **years**:
+Patients are **nested within** practices, and both levels vary over **years**:
 
 ```         
-practice (X1–X9)
-   └── practice_year (Z, post, n.patients, aggregated V*, practice Y†)
-         └── patient (V1–V5, id.practice)
-               └── patient_year (patient Y, by year)
-
+practice (X1-X9)
+  -> practice_year (Z, post, n.patients, aggregated V*, practice Y [drop in Track 1])
+       -> patient (V1-V5, id.practice)
+            -> patient_year (patient Y, by year)
 † Practice-level Y exists but should be dropped for Track 1 outcome modeling.
 ```
 
-This yields a *clustered* (practice-randomised) RCT structure with time.
+This yields a **cluster-randomised** (practice-level assignment) longitudinal RCT.
 
-# 3. Merge Rules (see file merging instructions)
+# 3. Merge Rules (file merging instructions applied)
 
-To build a full patient–year analysis dataset for one replicate:
-
-1.  **Add outcomes to patients**: join `patient` ➜ `patient_year` by `id.patient`.
-2.  **Attach practice covariates**: join with `practice` by `id.practice`.
-3.  **Attach practice-year treatment and context**: join with `practice_year` by `c(id.practice, year)`.
-4.  **Drop practice-level Y** to avoid ambiguity (keep only patient-level Y).
+1.  **Add outcomes to patients:** join `patient` → `patient_year` **by `id.patient`**.
+2.  **Attach practice covariates:** join with `practice` **by `id.practice`**.
+3.  **Attach practice-year treatment & context:** join with `practice_year` **by `c(id.practice, year)`**.
+4.  **Drop practice-level `Y`** to avoid ambiguity.
 
 ```{r load-and-merge, eval=FALSE}
-# ---- Packages ----
-suppressPackageStartupMessages({
-  library(fs)
-  library(glue)
-  library(dplyr)
-})
-
-
 # ---- Parameters ----
-base_dir <- "/Users/constanceko/Desktop/MAIHDA/ACIC_track1a_20220404"  # <-- your actual base path
-rid      <- sprintf("%04d", as.integer(params$replicate_id))            # e.g. "0001"
-read_engine <- getOption("acic.read_engine", "readr")
-
-
-# Choose reader: "readr" (default), "vroom", or "fread"
-read_engine <- getOption("acic.read_engine", "readr")
+base_dir <- params$data_dir
+rid      <- sprintf("%04d", as.integer(params$replicate_id))  # enforce "0001" format
+read_engine <- getOption("acic.read_engine", "readr")         # "readr", "vroom", or "fread"
 
 # ---- Paths ----
-dir_patient       <- path(base_dir, "patient")
-dir_patient_year  <- path(base_dir, "patient_year")
-dir_practice      <- path(base_dir, "practice")
-dir_practice_year <- path(base_dir, "practice_year")
+dir_patient       <- fs::path(base_dir, "patient")
+dir_patient_year  <- fs::path(base_dir, "patient_year")
+dir_practice      <- fs::path(base_dir, "practice")
+dir_practice_year <- fs::path(base_dir, "practice_year")
 
-# File name pattern used by ACIC 2022 Track 1
 fname <- function(prefix) glue("acic_{prefix}_{rid}.csv")
-
 files <- list(
-  patient       = path(dir_patient,       fname("patient")),
-  patient_year  = path(dir_patient_year,  fname("patient_year")),
-  practice      = path(dir_practice,      fname("practice")),
-  practice_year = path(dir_practice_year, fname("practice_year"))
+  patient       = fs::path(dir_patient,       fname("patient")),
+  patient_year  = fs::path(dir_patient_year,  fname("patient_year")),
+  practice      = fs::path(dir_practice,      fname("practice")),
+  practice_year = fs::path(dir_practice_year, fname("practice_year"))
 )
 
+# ---- Null-coalescing helper ----
+`%||%` <- function(a, b) if (is.null(a)) b else a
 
-# ---- Column types (be explicit; tweak if your files differ) ----
-# Patient
-colspec_patient <- list(
-  readr = readr::cols(
-    id.patient  = readr::col_integer(),
-    id.practice = readr::col_integer(),
-    V1 = readr::col_double(),
-    V2 = readr::col_integer(),
-    V3 = readr::col_integer(),
-    V4 = readr::col_double(),
-    V5 = readr::col_character()
-  ),
-  vroom = list(),  # vroom guesses reasonably; override if needed
-  fread = NULL
+# ---- Column specs (adjust if your files differ) ----
+colspec_patient_readr <- readr::cols(
+  id.patient  = readr::col_integer(),
+  id.practice = readr::col_integer(),
+  V1 = readr::col_double(),
+  V2 = readr::col_integer(),
+  V3 = readr::col_integer(),
+  V4 = readr::col_double(),
+  V5 = readr::col_character()
 )
 
-# Patient-Year
-colspec_patient_year <- list(
-  readr = readr::cols(
-    id.patient = readr::col_integer(),
-    year       = readr::col_integer(),
-    Y          = readr::col_double()
-  ),
-  vroom = list(),
-  fread = NULL
+colspec_patient_year_readr <- readr::cols(
+  id.patient = readr::col_integer(),
+  year       = readr::col_integer(),
+  Y          = readr::col_double()
 )
 
-# Practice
-colspec_practice <- list(
-  readr = readr::cols(
-    id.practice = readr::col_integer(),
-    X1 = readr::col_integer(),
-    X2 = readr::col_character(),
-    X3 = readr::col_integer(),
-    X4 = readr::col_character(),
-    X5 = readr::col_integer(),
-    X6 = readr::col_double(),
-    X7 = readr::col_double(),
-    X8 = readr::col_double(),
-    X9 = readr::col_double()
-  ),
-  vroom = list(),
-  fread = NULL
+colspec_practice_readr <- readr::cols(
+  id.practice = readr::col_integer(),
+  X1 = readr::col_integer(),
+  X2 = readr::col_character(),
+  X3 = readr::col_integer(),
+  X4 = readr::col_character(),
+  X5 = readr::col_integer(),
+  X6 = readr::col_double(),
+  X7 = readr::col_double(),
+  X8 = readr::col_double(),
+  X9 = readr::col_double()
 )
 
-# Practice-Year
-colspec_practice_year <- list(
-  readr = readr::cols(
-    id.practice = readr::col_integer(),
-    year        = readr::col_integer(),
-    Y           = readr::col_double(),   # will be dropped later
-    Z           = readr::col_integer(),
-    post        = readr::col_integer(),
-    n.patients  = readr::col_integer(),
-    .default    = readr::col_double()    # covers V*_avg columns
-  ),
-  vroom = list(),
-  fread = NULL
+colspec_practice_year_readr <- readr::cols(
+  id.practice = readr::col_integer(),
+  year        = readr::col_integer(),
+  Y           = readr::col_double(),   # to be dropped later
+  Z           = readr::col_integer(),
+  post        = readr::col_integer(),
+  n.patients  = readr::col_integer(),
+  .default    = readr::col_double()    # covers V*_avg or V*_C
 )
 
-# ---- Reader wrappers ----
+# ---- Reader wrapper ----
 read_csv_smart <- function(path, spec_readr = NULL) {
   switch(read_engine,
     readr = readr::read_csv(path, col_types = spec_readr %||% readr::cols(), show_col_types = FALSE),
-    vroom = vroom::vroom(path, altrep = TRUE),                 # very fast, multi-threaded
-    fread = data.table::fread(path, data.table = FALSE),       # very fast as well
+    vroom = vroom::vroom(path, altrep = TRUE),
+    fread = data.table::fread(path, data.table = FALSE),
     stop("Unknown read_engine: ", read_engine)
   )
 }
 
-`%||%` <- function(a, b) if (is.null(a)) b else a 
-
+# ---- Safety checks ----
+missing <- names(files)[!fs::file_exists(unname(files))]
+if (length(missing)) {
+  stop(glue("Missing files for rid={rid}: {paste(missing, collapse=', ')} under base_dir='{base_dir}'."))
+}
 
 # ---- Read ----
-patient <- read_csv_smart(files$patient,       colspec_patient[[ "readr" ]])
-patient_year <- read_csv_smart(files$patient_year,  colspec_patient_year[[ "readr" ]])
-practice <- read_csv_smart(files$practice,      colspec_practice[[ "readr" ]])
-practice_year <- read_csv_smart(files$practice_year, colspec_practice_year[[ "readr" ]])
+patient       <- read_csv_smart(files$patient,       colspec_patient_readr)
+patient_year  <- read_csv_smart(files$patient_year,  colspec_patient_year_readr)
+practice      <- read_csv_smart(files$practice,      colspec_practice_readr)
+practice_year <- read_csv_smart(files$practice_year, colspec_practice_year_readr)
 
-# ---- Basic diagnostics ----
-stopifnot(all(c("id.patient","id.practice") %in% names(patient)))
-stopifnot(all(c("id.patient","year","Y") %in% names(patient_year)))
-stopifnot("id.practice" %in% names(practice))
-stopifnot(all(c("id.practice","year","Z","post") %in% names(practice_year)))
-
-message(glue("Loaded replicate {rid} from {base_dir} with engine = {read_engine}."))
-dplyr::glimpse(patient, width = 80)
-dplyr::glimpse(patient_year, width = 80)
-dplyr::glimpse(practice, width = 80)
-dplyr::glimpse(practice_year, width = 80)
-
-
-
-
-# ---- Merge 1: patient + patient_year (add patient-level outcome Y) ----
+# ---- Merge 1: keep observed patient-years only ----
 d <- patient %>%
-  left_join(patient_year, by = "id.patient")   # brings in year and patient-level Y
+  inner_join(patient_year, by = "id.patient")  # ensures 'year' exists
 
-# ---- Merge 2: + practice (add practice-level covariates X1–X9) ----
+# ---- Merge 2: + practice (X1–X9) ----
 d <- d %>%
   left_join(practice, by = "id.practice")
 
-# ---- Merge 3: + practice_year (add Z, post, aggregates), by id.practice & year ----
+# ---- Merge 3: + practice_year (Z, post, aggregates) ----
 d <- d %>%
-  left_join(practice_year, by = c("id.practice", "year"),
-            suffix = c("", ".practice"))   # to disambiguate any overlaps
+  left_join(practice_year, by = c("id.practice", "year"), suffix = c("", ".practice"))
 
 # ---- Keep only the patient-level Y ----
-# If a column `Y.practice` exists from practice_year join, drop it:
-d <- d %>%
-  select(-any_of(c("Y.practice")))
+d <- d %>% select(-any_of("Y.practice"))
 
-# ---- Basic sanity checks ----
-stopifnot(!any(is.na(d$id.patient)))
-stopifnot(!any(is.na(d$id.practice)))
+# ---- Basic checks ----
+stopifnot(all(c("id.patient","id.practice","year","Y","Z","post") %in% names(d)))
 stopifnot(!any(is.na(d$year)))
+glue::glue("Rows: {nrow(d)}, Patients: {dplyr::n_distinct(d$id.patient)}, Practices: {dplyr::n_distinct(d$id.practice)}") |> message()
 
-# Example quick look:
-dplyr::glimpse(d)
+# Quick peek
+dplyr::glimpse(d, width = 80)
 ```
-
-> **Tip**: If your `practice_year` file labels aggregates as `V1_avg`, `V2_avg`, … keep them—they’re useful time-varying contextual controls.
 
 # 4. Variable Roles in Modeling
 
-+-------------------------+---------------+------------------------------------------------------------------+
-| Variable                | Level         | Typical Role                                                     |
-+=========================+===============+==================================================================+
-| `Y` (patient-level)     | Patient–Year  | **Outcome** (monthly average expenditure by year).               |
-+-------------------------+---------------+------------------------------------------------------------------+
-| `Z`                     | Practice–Year | **Treatment assignment** (cluster-RCT at practice-year level).   |
-+-------------------------+---------------+------------------------------------------------------------------+
-| `post`                  | Practice–Year | Post-intervention period indicator.                              |
-+-------------------------+---------------+------------------------------------------------------------------+
-| `V1–V5`                 | Patient       | Individual covariates (heterogeneity; adjustment; interactions). |
-+-------------------------+---------------+------------------------------------------------------------------+
-| `X1–X9`                 | Practice      | Time-invariant practice context (between-cluster differences).   |
-+-------------------------+---------------+------------------------------------------------------------------+
-| `V*_avg` / `n.patients` | Practice–Year | Time-varying practice context / scale, useful for trend control. |
-+-------------------------+---------------+------------------------------------------------------------------+
+| Variable | Level | Typical role |
+|------------------|------------------|------------------------------------|
+| `Y` (patient-level) | Patient–Year | **Outcome** (monthly avg expenditure by year). |
+| `Z` | Practice–Year | **Treatment assignment** (cluster-RCT at practice-year level). |
+| `post` | Practice–Year | Post-intervention period indicator. |
+| `V1–V5` | Patient | Individual covariates (heterogeneity / adjustment / interactions). |
+| `X1–X9` | Practice | Time-invariant practice context (between-cluster differences). |
+| `V*_avg` or `V*_C`, `n.patients` | Practice–Year | Time-varying context / scale, useful for trend control. |
 
 **Common pitfalls**
 
--   Do not mix the two `Y`s. Keep *patient* `Y` for Track 1.
--   Align join keys carefully: `id.patient`, `id.practice`, and `year`.
--   Patients may not appear in all years — this is **by design**, not missingness.
-
-
+-   Don’t mix the two `Y`s—use **patient** `Y` for Track-1.
+-   Join keys must align: `id.patient`, `id.practice`, `year`.
+-   Patients won’t appear in every year; this is **by design**, not missingness.
