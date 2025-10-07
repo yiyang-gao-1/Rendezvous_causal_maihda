@@ -1,0 +1,231 @@
+
+# 5. Using Track 1 for MAIHDA and Causal Analysis
+
+\*\* In **ACIC 2022 Track 1 (Patient-Year Data)**, the **treatment (`Z`) is assigned at the *practice-level***, *not* at the individual-patient level. This supports:
+
+-   **Random-intercept MAIHDA** (e.g., practice as a random effect; intersections via patient covariates).
+-   **Random-slope MAIHDA for Treatment** (allow treatment effect to vary across intersections/practices).
+-   **Causal-Forest-MAIHDA**: Estimate heterogeneous treatment effects (patient-level ITEs) while clustering or post-modeling standard errors at practice.
+
+## 5.1 How treatment assignment works in ACIC Track 1
+
+From the official data structure:
+
+```{r data-structure-table, echo=FALSE}
+data_structure <- data.frame(
+  Level = c("practice_year", "practice_year", "patient_year"),
+  Variable = c("Z", "post", "Y"),
+  Meaning = c(
+    "Treatment indicator (1 = treated practice in that year, 0 = control)",
+    "Period indicator – marks post-intervention years",
+    "Patient's individual outcome (monthly expenditure)"
+  )
+)
+
+kable(data_structure, 
+      caption = "ACIC Track 1 Data Structure",
+      format = "html") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE) %>%
+  column_spec(1, bold = TRUE, color = "navy") %>%
+  column_spec(2, bold = TRUE)
+```
+
+So:
+
+-   Each **practice** is the *cluster* (the unit of randomization)
+-   Within a practice, *all patients share the same treatment status Z* in a given year
+-   Outcomes Y are measured for each **patient**, producing many individual responses per practice
+
+This setup is the classic **cluster-randomised trial** (or "group-randomised RCT").
+
+# Implication for modeling
+
+## Multilevel interpretation
+
+Because patients are nested within practices:
+
+-   **Level 1 (patients)**: individual heterogeneity — covariates V₁–V₅, outcomes Y
+-   **Level 2 (practices)**: treatment assignment Z and contextual variables X₁–X₉
+-   **Time dimension**: repeated measures (patient-year and practice-year)
+
+## ️5.2 Why this structure suits MAIHDA extensions
+
+```{r maihda-models-table, echo=FALSE}
+maihda_models <- data.frame(
+  Model = c(
+    "Random-intercept MAIHDA",
+    "Random-slope MAIHDA for Treatment",
+    "Causal-Forest-MAIHDA"
+  ),
+  What_it_does = c(
+    "Captures between-practice variability (cluster effects)",
+    "Allows treatment effect Z to vary across practices or across patient-level intersections (e.g., by sex × ethnicity × income)",
+    "Uses machine-learning (e.g., GRF) to estimate individual treatment effects (ITEs) while accounting for cluster structure"
+  ),
+  Why_appropriate_here = c(
+    "Practices differ in baseline outcomes",
+    "Treatment heterogeneity across clusters and subgroups",
+    "Estimates heterogeneous effects under cluster-level assignment; practice IDs can be used as clusters in grf::causal_forest"
+  )
+)
+
+kable(maihda_models, 
+      caption = "MAIHDA Model Extensions for Cluster-Randomized Data",
+      format = "html") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE) %>%
+  column_spec(1, bold = TRUE, width = "25%") %>%
+  column_spec(2, width = "35%") %>%
+  column_spec(3, width = "40%")
+```
+
+
+## 5.3 Why we **can't** treat Z as individual-level
+
+If we did, we would be violating the design: every patient in a given practice-year shares the same Z, so there's **no within-practice treatment variation**.
+
+That means:
+
+-   We cannot identify the effect of Z from patient-level variation alone
+-   All identification comes from **between-practice** (and over-time) comparisons
+-   Standard errors must be **cluster-robust** or modeled with random effects for `id.practice`
+
+### Example code for proper modeling
+
+```{r modeling-example, eval=FALSE}
+# Incorrect: Ignoring cluster structure
+wrong_model <- lm(Y ~ Z + V1 + V2 + V3 + V4 + V5, data = d)
+
+# Correct Option 1: Mixed effects model with practice random effects
+correct_model1 <- lmer(Y ~ Z + V1 + V2 + V3 + V4 + V5 + 
+                       (1 | id.practice), 
+                       data = d)
+
+# Correct Option 2: Fixed effects with cluster-robust SEs
+library(sandwich)
+library(lmtest)
+fe_model <- lm(Y ~ Z + V1 + V2 + V3 + V4 + V5 + 
+               factor(id.practice), 
+               data = d)
+coeftest(fe_model, vcov = vcovCL, cluster = ~ id.practice)
+
+# Correct Option 3: GRF with cluster specification
+library(grf)
+cf_model <- causal_forest(
+  X = as.matrix(d[, c("V1", "V2", "V3", "V4", "V5")]),
+  Y = d$Y,
+  W = d$Z,
+  clusters = d$id.practice
+)
+```
+
+
+
+## 5.4 Summary
+
+```{r summary-table, echo=FALSE}
+summary_concepts <- data.frame(
+  Concept = c(
+    "Treatment (Z)",
+    "Outcome (Y)",
+    "Covariates (V₁–V₅)",
+    "Context (X₁–X₉, V*_avg, n.patients)",
+    "Design type"
+  ),
+  Level = c(
+    "Practice-year (cluster level)",
+    "Patient-year (individual level)",
+    "Patient level",
+    "Practice or practice-year",
+    "Cluster-randomized longitudinal RCT"
+  )
+)
+
+kable(summary_concepts, 
+      caption = "Key Concepts and Their Levels",
+      format = "html") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE) %>%
+  column_spec(1, bold = TRUE, color = "darkblue") %>%
+  row_spec(1, bold = TRUE, background = "#f0f0f0")
+```
+
+
+## 5.5 Visualizing cluster structure
+
+```{r viz-clusters, eval=FALSE}
+# Visualize treatment assignment by practice
+library(ggplot2)
+
+practice_summary <- analysis_data %>%
+  group_by(id.practice, Z) %>%
+  summarise(
+    mean_outcome = mean(Y, na.rm = TRUE),
+    n_obs = n()
+  )
+
+ggplot(practice_summary, aes(x = factor(Z), y = mean_outcome)) +
+  geom_boxplot(aes(fill = factor(Z))) +
+  geom_jitter(alpha = 0.3, width = 0.1) +
+  scale_fill_manual(values = c("0" = "lightblue", "1" = "salmon"),
+                    labels = c("Control", "Treated")) +
+  labs(
+    title = "Distribution of Mean Outcomes by Practice Treatment Status",
+    x = "Treatment Status",
+    y = "Mean Patient Outcome",
+    fill = "Treatment"
+  ) +
+  theme_minimal()
+```
+
+Below is a lightweight modeling scaffold you can adapt (replace with your preferred engines):
+
+```{r model-scaffolds, eval=FALSE}
+# Example formulas (choose based on outcome distribution and design)
+
+# (A) LMM/GLMM with random intercept for practice and random treatment slope
+# Outcome is continuous (e.g., Y)
+library(lme4)
+m_maihda <- lmer(
+  Y ~ Z * (V1 + V2 + V3 + V4 + V5) + post + 
+    (1 + Z | id.practice),
+  data = d
+)
+summary(m_maihda)
+
+# (B) Causal Forest sketch (grf) for ITEs (no random effects; cluster-robust SEs later)
+# Create design matrices
+library(grf)
+
+# Features (X) can include patient covariates + practice-year context
+X <- d %>% 
+  select(V1, V2, V3, V4, V5, starts_with("V"), starts_with("X"), n.patients, post) %>% 
+  as.matrix()
+
+W <- d$Z              # treatment
+Y_out <- d$Y          # outcome
+
+set.seed(1)
+cf <- causal_forest(X = X, Y = Y_out, W = W, clusters = d$id.practice)
+tau_hat <- predict(cf)$predictions
+
+# Attach ITEs back
+d$tau_hat <- tau_hat
+summary(d$tau_hat)
+```
+
+> For presentations/deliverables, you can compute ATE/CATEs, plot heterogeneity by intersections (e.g., combinations of `V1–V5`), and compare MAIHDA random slopes vs. CF CATE summaries.
+
+------------------------------------------------------------------------
+
+## Appendix: Quick Data Dictionary Stubs
+
+-   **Patient-level (`patient`)**: `id.patient`, `id.practice`, `V1–V5` (individual covariates).
+-   **Patient-year (`patient_year`)**: `id.patient`, `year`, `Y` (patient outcome).
+-   **Practice (`practice`)**: `id.practice`, `X1–X9` (practice covariates).
+-   **Practice-year (`practice_year`)**: `id.practice`, `year`, `Z` (treatment), `post`, `n.patients`, aggregated `V*` (context), and a practice-level `Y` (drop for Track 1 outcome modeling).
+
+------------------------------------------------------------------------
+
+*Edit the `params:` at the top or set `eval=TRUE` in code chunks when your data files are in place. If you want, I can tailor this to your exact column names (`_avg` vs `_C` suffixes) and add convenience functions (e.g., a `load_track1_replicate()` helper).*

@@ -1,0 +1,433 @@
+---
+title: "Causal-MAIHDA Starter (ACIC 2022)"
+author: "Yiyang Gao"
+date: "`r format(Sys.Date())`"
+output:
+  pdf_document:
+    latex_engine: xelatex
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    df_print: paged
+  word_document:
+    toc: true
+    toc_depth: '3'
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+if (!tinytex::is_tinytex()) {
+  tinytex::install_tinytex(force = TRUE)
+}
+options(tinytex.engine = "xelatex")
+
+```
+
+# 0) Introduction: ACIC and the ACIC-2022 Challenge
+
+This demo includes:
+
+-   A clear **introduction to ACIC and ACIC-2022**
+-   Track definitions and cross-year comparison
+-   Data structure explanation (four-table schema)
+-   Full working **ACIC-based Causal-MAIHDA script**
+
+The **Atlantic Causal Inference Conference (ACIC)** Data Challenge is an
+open benchmarking platform for causal-inference methods. Each release
+provides **semi-synthetic datasets with known ground truth treatment
+effects**, allowing researchers to evaluate algorithms such as
+propensity-score matching, causal forests, and the **Causal-MAIHDA**
+framework.
+
+The **ACIC 2022 Challenge** focuses on **hierarchical healthcare data**
+(patients - practices - time/year) and introduces multiple **tracks**
+representing randomized vs. observational and panel vs. cross-sectional
+designs.
+
+------------------------------------------------------------------------
+
+## 0.1 How to Obtain and Organise ACIC 2022 Data
+
+-   **Public repository:** <https://acic2022.org> → *Data Challenge →
+    Track 1a Download*
+
+-   **After extraction (Track 1a example):**
+
+```         
+ACIC_track1a_20220404/
+|-- File merging instructions.pdf
+|-- patient/
+|   |-- acic_patient_0001.csv ... acic_patient_1200.csv
+|-- patient_year/
+|   |-- acic_patient_year_0001.csv ... acic_patient_year_1200.csv
+|-- practice/
+|   |-- acic_practice_0001.csv ... acic_practice_1200.csv
+|-- practice_year/
+    |-- acic_practice_year_0001.csv ... acic_practice_year_1200.csv
+```
+
+Each numbered set (e.g., `0987`) is a complete **replicate** comprising
+four matched tables.
+
+------------------------------------------------------------------------
+
+## 0.2 ACIC 2022 Tracks
+
+```{r tracks-table, echo=FALSE}
+
+tracks <- data.frame(
+  Track = c("1a","1b","2a","2b"),
+  Structure = c("Patient–Year panel","Patient cross-section",
+                "Patient–Year panel","Patient cross-section"),
+  Randomization = c("Yes (practice-level Z)","Yes (practice-level Z)",
+                    "No (observational)","No (observational)"),
+  Time_Varying = c("Yes","No","Yes","No"),
+  Files_per_rep = c("patient, patient_year, practice, practice_year",
+                    "patient, practice",
+                    "patient, patient_year, practice, practice_year",
+                    "patient, practice")
+)
+
+knitr::kable(tracks, caption = "ACIC 2022 Tracks overview")
+```
+
+------------------------------------------------------------------------
+
+## 0.3 ACIC Datasets over Time
+
+```{r years-table, echo=FALSE}
+years <- data.frame(
+  Year = c("2016","2019","2022"),
+  Focus = c("Foundational synthetic datasets",
+            "Multiple data-generating processes; stronger heterogeneity",
+            "Hierarchical healthcare simulation; randomized & observational tracks"),
+  Hierarchy = c("Flat (individual)","Flat or varied","Hierarchical (patient–practice–year)"),
+  Tracks = c("N/A","N/A","1a / 1b / 2a / 2b"),
+  Typical_Use = c("ATE / CATE method benchmarks",
+                  "Robustness across DGPs",
+                  "Hierarchical causal inference and Causal-MAIHDA")
+)
+knitr::kable(years, caption = "ACIC datasets over time")
+```
+
+------------------------------------------------------------------------
+
+## 0.4 Track 1a Data Structure and Variables
+
+Four linked tables form a **star-schema**:
+
+| Merge Order | Level | Key | Description |
+|----------------|----------------|----------------|-------------------------|
+| ① `patient_year` | patient × year | (`id.patient`, `year`) | Patient-year panel with outcome Y |
+| ② `patient` | patient | `id.patient` | Patient characteristics + practice ID |
+| ③ `practice` | practice | `id.practice` | Practice-level static features |
+| ④ `practice_year` | practice × year | (`id.practice`, `year`) | Time-varying practice info: Z, post, n.patients |
+
+**Treatment definition:** `Z` = practice-level treatment (1 = treated)
+`post` = post-intervention period (1 = after) → Patient-year exposure
+`W = (Z == 1 & post == 1)`
+
+------------------------------------------------------------------------
+
+# 1) ACIC-2022 Data Structure (Track 1a example)
+
+```{r packages}
+
+pkgs <- c("data.table","dplyr","tidyr","forcats","ggplot2","lme4","grf","patchwork","merTools","tinytex")
+# Create a character vector pkgs that lists the names of the desired packages.
+
+to_install <- setdiff(pkgs, rownames(installed.packages())) 
+# Identifies packages that are "not yet installed"
+if (length(to_install)) install.packages(to_install, repos = "https://cloud.r-project.org")
+# If the length of to_install is not 0 (i.e., there are missing packages), 
+# then execute the installation.
+
+
+suppressPackageStartupMessages({
+  library(tinytex)
+  library(knitr)  # A transparent engine for dynamic report generation
+  library(data.table) # Efficient data reading/writing/processing, fread()
+  library(dplyr) # Data processing, filter(), mutate().
+  library(tidyr) # data shaping, pivot_longer()
+  library(forcats) # Simplifies working with categorical variables (factors) through recoding, reordering, and combining operations.
+  library(ggplot2) # Visualisations
+  library(lme4) # Fits linear and generalized linear mixed-effects models
+  library(grf) # Implements generalized random forests for causal inference and heterogeneous treatment effect estimation.
+  library(patchwork) # Combines multiple ggplot2 plots into cohesive multi-panel figures.
+  library(merTools) # Extends lme4 with tools for mixed model simulation, visualisation, and diagnostics.
+})
+
+
+```
+
+```{r load-merge}
+# --- choose replicate (1..1200) ---
+replicate_id_int <- 987
+replicate_id <- sprintf("%04d", replicate_id_int)
+
+base_dir <- "/Users/constanceko/Desktop/MAIHDA/ACIC_track1a_20220404"
+# You need to change this base_dir to your local file path. Here, 
+# I have this folder on my desktop. 
+
+# --- build file paths ---
+fp_patient_year  <- file.path(base_dir,"patient_year", sprintf("acic_patient_year_%s.csv", replicate_id))
+
+# base_dir is the folder that contains all four subfolders (e.g. /Users/constanceko/Desktop/MAIHDA/ACIC_track1a_20220404). 
+# "patient_year" is the subfolder name.
+# sprintf("acic_patient_year_%s.csv", replicate_id) creates the filename dynamically by inserting our replicate number (e.g., "acic_patient_year_0987.csv").
+# file.path() safely joins these pieces using the operating system’s correct path separator (/ on Mac/Linux, \ on Windows).
+
+fp_patient       <- file.path(base_dir,"patient",      sprintf("acic_patient_%s.csv", replicate_id))
+
+fp_practice      <- file.path(base_dir,"practice",     sprintf("acic_practice_%s.csv", replicate_id))
+
+fp_practice_year <- file.path(base_dir,"practice_year",sprintf("acic_practice_year_%s.csv", replicate_id))
+
+rd <- function(p){ stopifnot(file.exists(p));  # check the file actually exists
+  as.data.frame(fread(p,showProgress=TRUE)) }  # read CSV fast and return a data.frame
+
+
+# rd() is a small custom reader function ("read data").
+# It takes one argument p = the path to a CSV file.
+# stopifnot(file.exists(p)) → If the file doesn’t exist, stop immediately with an error message.
+
+# fread(p, showProgress=TRUE) → Comes from the data.table package, which is much faster than read.csv() for large files.
+
+# as.data.frame() → Converts the data.table object to a standard R data.frame, so all our later code (joins, dplyr, etc.) works normally.
+
+
+
+# --- read data ---
+patient_year  <- rd(fp_patient_year)
+patient       <- rd(fp_patient)
+practice      <- rd(fp_practice)
+practice_year <- rd(fp_practice_year)
+
+# --- clean types and drop unwanted columns ---
+patient_year  <- mutate(patient_year,  
+                        id.patient=as.integer(id.patient), 
+                        year=as.integer(year)) 
+
+patient       <- mutate(patient,       
+                        id.patient=as.integer(id.patient),
+                        id.practice=as.integer(id.practice))
+
+practice      <- mutate(practice,      
+                        id.practice=as.integer(id.practice))
+
+practice_year <- mutate(practice_year, 
+                        id.practice=as.integer(id.practice), 
+                        year=as.integer(year))
+
+if("Y" %in% names(practice_year)) practice_year <- practice_year[, setdiff(names(practice_year),"Y"), drop=FALSE]
+# This line is a safety check that makes sure the outcome variable only appears in the
+# patient-level data, not in the practice-level table.
+# In some versions of the ACIC files, the table `practice_year` includes an aggregate 
+# version of Y (like the average outcome per practice per year). But for our 
+# individual-level analysis, we don’t want that column, because it's redundant with the # true patient-level outcome. If it stays in, it can confuse joins or models later. 
+
+# `names(practice_year)`  | the current column names                                    # `setdiff(names(practice_year), "Y")` | returns all column names **except** `"Y"`      # `practice_year[, ... , drop=FALSE]`  | selects only those columns, and ensures the result stays a data frame even if only one column remains 
+# `practice_year <- ...` | replaces the old version with this trimmed version           # So after running this line, if `Y` existed before, it is removed; if not, nothing changes.
+
+
+# --- merge star schema ---
+# Star schema refers to the data model: one central fact table (patient_year) joined to several dimension tables (patient, practice, practice_year).
+
+df <- patient_year %>% 
+  # Start with patient_year — this is the base table (patient × year outcomes)
+  left_join(patient,  by="id.patient") %>%
+  # Adds each patient’s static information (V1–V5, id.practice).
+  # keep all patient-year rows, even if some patients have missing info in patient.
+  left_join(practice, by="id.practice")
+  # Now that each patient is linked to their id.practice, this join adds the practice-level characteristics (X1–X9).
+
+keep_cols <- intersect(c("id.practice","year","Z","post","n.patients","V1_C","V2_C","V3_C","V4_C","V5_C"),
+                       names(practice_year))
+
+# names(practice_year) lists all the columns in the practice_year table.
+# The vector on the left are the variables we want to include.
+# id.practice and year are the join keys.
+# Z, post, n.patients are treatment/time variables.
+# V1_C–V5_C are practice-level averages of patient covariates.
+# intersect() keeps only the column names that exist in both lists. This makes the code robust: if, say, some version of the dataset doesn’t contain V5_C, it won’t throw an error.
+
+df <- left_join(df, practice_year[, keep_cols, drop=FALSE], 
+                by=c("id.practice","year"))
+
+
+
+# --- panel features ---
+df <- df %>%
+  arrange(id.patient,year) %>%
+  group_by(id.patient) %>%
+  mutate(Y_lag = dplyr::lag(Y)) %>%
+  ungroup() %>%
+  mutate(W = as.integer(Z==1 & post==1),
+         year=factor(year),
+         id.practice=factor(id.practice),
+         id.patient=factor(id.patient))
+
+str(df)
+```
+
+------------------------------------------------------------------------
+
+# 2) MAIHDA Quickstart (using ACIC data)
+
+This section mimics [George Leckie’s MAIHDA tutorial](https://www.youtube.com/watch?v=pVw591QpuWc)
+from the University of Bristol’s Centre for Multilevel Modelling.
+
+
+```{r quickstart}
+
+
+bin3 <- function(x, nm) {
+  qs <- quantile(x, probs = c(0, 1/3, 2/3, 1), na.rm = TRUE)
+  qs <- unique(qs)  # remove duplicates
+  if (length(qs) < 3) {
+    # if not enough unique cut points, return a single-level factor
+    return(factor(paste0(nm, "_L")))
+  }
+  cut(x, qs, include.lowest = TRUE,
+      labels = paste0(nm, c("_L","_M","_H")[1:(length(qs)-1)]))
+}
+# This is a helper function that divides a numeric variable into three equal-sized groups (or bins) based on its quantiles. 
+
+df <- df %>%
+  mutate(
+    V1_q = if("V1"%in%names(df)) bin3(V1,"V1") else factor("V1_L"),
+    V2_q = if("V2"%in%names(df)) bin3(V2,"V2") else factor("V2_L"),
+    X1_q = if("X1"%in%names(df)) bin3(X1,"X1") else factor("X1_L")
+  )
+
+df$strata <- interaction(df$V1_q, df$V2_q, df$X1_q, drop=TRUE)
+
+main_terms <- c("V1_q","V2_q","X1_q")
+
+# Drop variables that have only 1 level
+main_terms <- main_terms[sapply(df[, main_terms, drop = FALSE], nlevels) > 1]
+
+m1 <- lmer(as.formula(paste("Y ~", paste(main_terms,collapse="+"), "+ (1|strata)")), data=df)
+
+m2 <- lmer(as.formula(paste("Y ~ W +", paste(main_terms,collapse="+"), "+ (1+W|strata)")), data=df)
+
+cat("\n[Quickstart] Random-effects variance (Model 2; strata block):\n")
+print(VarCorr(m2)$strata)
+
+re_qs <- ranef(m2)$strata
+colnames(re_qs) <- c("Intercept_RE","W_slope_RE")
+ggplot(as.data.frame(re_qs), aes(x=W_slope_RE)) +
+  geom_histogram(bins=24) +
+  labs(title="Random slopes of W across strata (MAIHDA quickstart)",
+       x="Deviation from overall W effect", y="Number of strata") +
+  theme_minimal()
+```
+
+------------------------------------------------------------------------
+
+# 3) RCT-MAIHDA: Causal Forest → MAIHDA
+
+Estimate individual Conditional Average Treatment Effects (CATEs) via a
+causal forest, then model those effects hierarchically with MAIHDA.
+
+```{r cf-maihda}
+X_pat  <- intersect(paste0("V",1:5), names(df))
+X_prac <- intersect(paste0("X",1:9), names(df))
+X_cols_all <- unique(c(X_pat,X_prac,"post","Y_lag","year"))
+
+cc_idx <- complete.cases(df[,unique(c("Y","W",X_cols_all)),drop=FALSE])
+if(sum(!cc_idx)>0) message("Dropping ",sum(!cc_idx)," rows with NA in {Y,W,X}.")
+dfx <- df[cc_idx, , drop=FALSE]
+
+X <- model.matrix(~ . -1, data=dfx[,X_cols_all,drop=FALSE])
+Yv <- as.numeric(dfx$Y); Wv <- as.numeric(dfx$W); clusters <- dfx$id.practice
+
+# cf <- causal_forest(X,Yv,Wv,clusters=clusters,num.trees=2000,sample.fraction=0.5,honesty=TRUE)
+
+# Cut trees and fraction for speed 
+cf <- causal_forest(
+  X, Yv, Wv, clusters = clusters,
+  num.trees = 800,            
+  sample.fraction = 0.3,      
+  honesty = TRUE,
+  tune.parameters = "none",   # skip costly auto-tuning
+  mtry = max(1, round(ncol(X)/3)),
+  min.node.size = 5,
+  num.threads = parallel::detectCores()  # use all cores if available
+)
+
+
+tau_hat <- as.numeric(predict(cf)$predictions)
+ate <- average_treatment_effect(cf,target.sample="treated")
+cat(sprintf("\n[CF] ATE (treated) = %.3f (95%% CI %.3f, %.3f)\n",
+            ate["estimate"],ate["ci.low"],ate["ci.high"]))
+
+dfx$tau_hat <- tau_hat
+dfx$strata <- droplevels(df$strata[cc_idx])
+m_maihda <- lmer(tau_hat ~ 1 + (1|strata), data=dfx)
+as.data.frame(VarCorr(m_maihda))
+```
+
+------------------------------------------------------------------------
+
+## 3.1 Visualisations
+
+```{r cf-maihda-plots, fig.width=13, fig.height=8}
+
+tau_by_strata <- dfx %>%
+  group_by(strata) %>%
+  summarise(n=n(), tau_mean=mean(tau_hat), .groups="drop") %>%
+  arrange(desc(n))
+topK <- min(20, nrow(tau_by_strata))
+p1 <- ggplot(head(tau_by_strata,topK),
+             aes(x=forcats::fct_reorder(strata,tau_mean), y=tau_mean)) +
+  geom_col() + coord_flip() +
+  labs(x="Strata (top by n)", y="Mean CATE (CF)",
+     title="CF -> Mean CATE by Intersectional Strata")
+  theme_minimal()
+
+
+rf_y <- regression_forest(
+  X, Yv,
+  num.trees = 300,
+  tune.parameters = "none",
+  mtry = max(1, round(ncol(X)/3)),
+  min.node.size = 5
+)
+
+vi <- variable_importance(rf_y)
+vi_df <- tibble(var=colnames(X), importance=vi) %>% arrange(desc(importance))
+p2 <- vi_df %>% slice_head(n=10) %>%
+  ggplot(aes(x=reorder(var,importance), y=importance)) +
+  geom_col() + coord_flip() +
+  labs(x=NULL,y="Importance",title="Top 10 Variable Importance (for Y)") +
+  theme_minimal()
+
+p1 | p2
+```
+
+------------------------------------------------------------------------
+
+# Appendix — Paths and Usage
+
+-   Example file used:
+    `/Users/constanceko/Desktop/MAIHDA/ACIC_track1a_20220404/patient_year/acic_patient_year_0987.csv`
+-   To switch replicates, change `replicate_id_int <- 987` to any
+    1–1200.
+-   Each replicate = 4 CSV files (patient, patient_year, practice,
+    practice_year) with matching ID.
+
+------------------------------------------------------------------------
+
+### Teaching prompts
+
+-   **MAIHDA Quickstart:** Random intercepts capture mean differences
+    between intersectional strata; random slopes for W capture
+    treatment-effect heterogeneity. Partial pooling stabilizes sparse
+    strata.
+-   **Causal Forest → MAIHDA:** We first estimate *who benefits more*
+    (CATEs) using CF, then summarise and visualise that heterogeneity
+    across intersectional strata via MAIHDA.
+
+------------------------------------------------------------------------

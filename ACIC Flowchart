@@ -1,0 +1,238 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ACIC Data Challenge Process</title>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            margin: 0;
+            padding: 20px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+        }
+        .container {
+            background: white;
+            border-radius: 20px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+            padding: 40px;
+            max-width: 1200px;
+            width: 100%;
+        }
+        h1 {
+            text-align: center;
+            color: #333;
+            margin-bottom: 40px;
+            font-size: 28px;
+        }
+        .flowchart {
+            display: flex;
+            flex-direction: column;
+            gap: 30px;
+        }
+        .stage {
+            display: flex;
+            align-items: center;
+            gap: 20px;
+            position: relative;
+        }
+        .stage-number {
+            width: 50px;
+            height: 50px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border-radius: 50%;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            font-weight: bold;
+            font-size: 20px;
+            flex-shrink: 0;
+        }
+        .stage-content {
+            flex: 1;
+            background: #f8f9fa;
+            border-radius: 15px;
+            padding: 25px;
+            border: 2px solid #e9ecef;
+            transition: all 0.3s ease;
+        }
+        .stage-content:hover {
+            transform: translateX(5px);
+            box-shadow: 0 5px 15px rgba(0,0,0,0.1);
+            border-color: #667eea;
+        }
+        .stage-title {
+            font-size: 20px;
+            color: #495057;
+            font-weight: bold;
+            margin-bottom: 10px;
+        }
+        .stage-description {
+            color: #6c757d;
+            line-height: 1.6;
+        }
+        .arrow {
+            width: 0;
+            height: 0;
+            border-left: 15px solid transparent;
+            border-right: 15px solid transparent;
+            border-top: 25px solid #667eea;
+            margin: 0 auto;
+            opacity: 0.6;
+        }
+        .details-list {
+            margin-top: 15px;
+            padding-left: 20px;
+        }
+        .details-list li {
+            color: #6c757d;
+            margin: 8px 0;
+            list-style-type: none;
+            position: relative;
+            padding-left: 20px;
+        }
+        .details-list li:before {
+            content: "→";
+            position: absolute;
+            left: 0;
+            color: #667eea;
+            font-weight: bold;
+        }
+        .highlight {
+            color: #764ba2;
+            font-weight: 600;
+        }
+        @media (max-width: 768px) {
+            .container {
+                padding: 20px;
+            }
+            .stage-content {
+                padding: 15px;
+            }
+            .stage-title {
+                font-size: 18px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>ACIC Data Challenge Process Flowchart</h1>
+        <div class="flowchart">
+            <div class="stage">
+                <div class="stage-number">1</div>
+                <div class="stage-content">
+                    <div class="stage-title">DATA GENERATION & SIMULATION</div>
+                    <div class="stage-description">
+                        Organizers (Mathematica team) create thousands of synthetic datasets based on real-world patterns
+                    </div>
+                    <ul class="details-list">
+                        <li>Use <span class="highlight">real healthcare/education data structures</span> as templates</li>
+                        <li>Embed <span class="highlight">known true causal effects</span> (ground truth)</li>
+                        <li>Include realistic challenges: <span class="highlight">confounding</span>, <span class="highlight">selection bias</span>, <span class="highlight">heterogeneous effects</span></li>
+                        <li>Create hierarchical structures (e.g., patients nested in practices)</li>
+                        <li>Include highly skewed outcomes (e.g., Medicare spending)</li>
+                    </ul>
+                </div>
+            </div>
+            
+            <div class="arrow"></div>
+            
+            <div class="stage">
+                <div class="stage-number">2</div>
+                <div class="stage-content">
+                    <div class="stage-title">DATA RELEASE</div>
+                    <div class="stage-description">
+                        Simulated datasets are released to participating teams
+                    </div>
+                    <ul class="details-list">
+                        <li>Teams receive <span class="highlight">covariate data</span> (X)</li>
+                        <li>Teams receive <span class="highlight">treatment indicators</span> (T)</li>
+                        <li>Teams receive <span class="highlight">observed outcomes</span> (Y)</li>
+                        <li><span class="highlight">True causal effects remain hidden</span> from participants</li>
+                    </ul>
+                </div>
+            </div>
+            
+            <div class="arrow"></div>
+            
+            <div class="stage">
+                <div class="stage-number">3</div>
+                <div class="stage-content">
+                    <div class="stage-title">COMPETING ALGORITHMS APPLY METHODS</div>
+                    <div class="stage-description">
+                        Teams apply their causal inference methods to estimate treatment effects
+                    </div>
+                    <ul class="details-list">
+                        <li><span class="highlight">Machine Learning approaches</span> (Random Forests, Neural Networks)</li>
+                        <li><span class="highlight">Bayesian methods</span> (BART, Gaussian Processes)</li>
+                        <li><span class="highlight">Propensity score methods</span> (Matching, Weighting, Stratification)</li>
+                        <li><span class="highlight">Doubly robust estimators</span> (AIPW, TMLE)</li>
+                        <li><span class="highlight">Ensemble methods</span> combining multiple approaches</li>
+                    </ul>
+                </div>
+            </div>
+            
+            <div class="arrow"></div>
+            
+            <div class="stage">
+                <div class="stage-number">4</div>
+                <div class="stage-content">
+                    <div class="stage-title">TEAMS SUBMIT ESTIMATES</div>
+                    <div class="stage-description">
+                        Participating teams submit their causal effect estimates
+                    </div>
+                    <ul class="details-list">
+                        <li>Estimates of <span class="highlight">Average Treatment Effect (ATE)</span></li>
+                        <li>Estimates of <span class="highlight">Conditional Average Treatment Effects (CATE)</span></li>
+                        <li>Uncertainty quantification (<span class="highlight">confidence/credible intervals</span>)</li>
+                        <li>Subgroup effect estimates</li>
+                    </ul>
+                </div>
+            </div>
+            
+            <div class="arrow"></div>
+            
+            <div class="stage">
+                <div class="stage-number">5</div>
+                <div class="stage-content">
+                    <div class="stage-title">EVALUATION METRICS</div>
+                    <div class="stage-description">
+                        Organizers compare submitted estimates against known ground truth
+                    </div>
+                    <ul class="details-list">
+                        <li><span class="highlight">Bias</span>: How close are estimates to true effects?</li>
+                        <li><span class="highlight">Root Mean Squared Error (RMSE)</span>: Overall accuracy</li>
+                        <li><span class="highlight">Coverage</span>: Do confidence intervals contain true values?</li>
+                        <li><span class="highlight">Precision</span>: Width of confidence intervals</li>
+                        <li><span class="highlight">Heterogeneity capture</span>: How well do methods identify effect variation?</li>
+                    </ul>
+                </div>
+            </div>
+            
+            <div class="arrow"></div>
+            
+            <div class="stage">
+                <div class="stage-number">6</div>
+                <div class="stage-content">
+                    <div class="stage-title">RESULTS & INSIGHTS</div>
+                    <div class="stage-description">
+                        Winners announced and lessons learned shared with the field
+                    </div>
+                    <ul class="details-list">
+                        <li>Identify <span class="highlight">best-performing methods</span> for different scenarios</li>
+                        <li>Reveal <span class="highlight">strengths and weaknesses</span> of various approaches</li>
+                        <li>Inform <span class="highlight">future policy evaluations</span></li>
+                        <li>Advance the field of <span class="highlight">causal inference methodology</span></li>
+                    </ul>
+                </div>
+            </div>
+        </div>
+    </div>
+</body>
+</html>
