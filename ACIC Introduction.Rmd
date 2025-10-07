@@ -1,5 +1,5 @@
 ---
-title: "ACIC 2022 Track 1 (Patient–Year) Data Structure and Merge Guide"
+title: "ACIC 2022 Track 1 (Patient–Year) Data Structure + Merge and Readable Strata Guide"
 author: "Yiyang Gao"
 date: "`r format(Sys.time(), '%Y-%m-%d')`"
 output:
@@ -11,53 +11,147 @@ output:
     toc_depth: 3
     df_print: paged
 params:
-  data_dir: "/Users/constanceko/Desktop/MAIHDA/ACIC_track1a_20220404"  # set your base path
-  replicate_id: "0001"   # valid range: 0001–3400
+  data_dir: "/Users/constanceko/Desktop/MAIHDA/ACIC_track1a_20220404"
+  replicate_id: "0001"
+header-includes:
+  - \usepackage{booktabs}
+  - \usepackage{longtable}
+  - \usepackage{array}
 ---
+
 
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(message = FALSE, warning = FALSE)
+
 suppressPackageStartupMessages({
   library(dplyr)
   library(readr)
   library(fs)
   library(glue)
+  library(tidyr)
+  library(knitr)
+  library(tibble)
+  library(forcats)
+  library(stringr)
 })
 ```
 
-# 1. The Four Core Files (Structure and Meaning)
+# The Four Core Files (Structure and Meaning)
 
-**Track 1** provides four CSVs per replicate (e.g., `xxxx = 0001`, replicates range **0001–1200**; files are split across zip parts a/b/c):
+**Track 1** provides four CSVs per replicate (e.g., `xxxx = 0001`, public replicates often 0001–1200).
 
-| File | Level (Uniqueness) | Key(s) | Main contents |
-|---------------|---------------|---------------|---------------------------|
-| `patient_xxxx.csv` | Patient (time-invariant) | `id.patient` | One row per patient. Patient covariates **V1–V5** and clinic ID **id.practice**. |
-| `patient_year_xxxx.csv` | Patient–Year (time-varying) | `id.patient`, `year` | One row per patient per year. Outcome **Y** = monthly average medical expenditure for that year. Patients do **not** appear in all years by design (aging in/out, death). |
-| `practice_xxxx.csv` | Practice (time-invariant) | `id.practice` | One row per practice. Practice covariates **X1–X9**. |
-| `practice_year_xxxx.csv` | Practice–Year (time-varying) | `id.practice`, `year` | One row per practice per year: **Z** (treatment), **post** (post period), **n.patients**, practice-year aggregates (e.g., **V1_C–V5_C** or **V1_avg–V5_avg**), and a practice-level **Y** (drop this for Track-1 outcome modeling). |
+```{r four-files-table}
+four_files <- tribble(
+  ~File, ~`Level (Uniqueness)`, ~`Key(s)`, ~`Main contents`,
+  "patient_xxxx.csv",        "Patient (time-invariant)",      "id.patient",                        "One row per patient. Patient covariates V1–V5 and clinic ID id.practice.",
+  "patient_year_xxxx.csv",   "Patient–Year (time-varying)",   "id.patient, year",                  "One row per patient per year. Outcome Y = monthly average medical expenditure for that year. Patients do not appear in all years by design.",
+  "practice_xxxx.csv",       "Practice (time-invariant)",     "id.practice",                       "One row per practice. Practice covariates X1–X9.",
+  "practice_year_xxxx.csv",  "Practice–Year (time-varying)",  "id.practice, year",                 "One row per practice per year: Z (treatment), post (post period), n.patients, practice-year aggregates (e.g., V1_avg–V5_avg), and a practice-level Y (drop this for Track-1 outcome modelling)."
+)
+
+kable(
+  four_files,
+  format = ifelse(knitr::is_latex_output(), "latex", "simple"),
+  booktabs = knitr::is_latex_output(),
+  align = "l",
+  caption = "Overview of ACIC Track 1 data files"
+)
+```
 
 > **Track-1 outcome:** keep **patient-level `Y`** from `patient_year_xxxx.csv`; **drop** the practice-level `Y` from `practice_year_xxxx.csv`.
 
-# 2. Hierarchical Relationships
-
-Patients are **nested within** practices, and both levels vary over **years**:
-
-```         
-practice (X1-X9)
-  -> practice_year (Z, post, n.patients, aggregated V*, practice Y [drop in Track 1])
-       -> patient (V1-V5, id.practice)
-            -> patient_year (patient Y, by year)
-† Practice-level Y exists but should be dropped for Track 1 outcome modeling.
+```
+practice (X1–X9)
+  ---> practice_year (Z, post, n.patients, aggregated V*, practice Y [drop in Track 1])
+       ---> patient (V1–V5, id.practice)
+            ---> patient_year (patient Y, by year)
+> Practice-level Y exists but should be dropped for Track 1 outcome modelling.
 ```
 
 This yields a **cluster-randomised** (practice-level assignment) longitudinal RCT.
 
-# 3. Merge Rules (file merging instructions applied)
+# Peek at the first rows (for each of the four files)
 
-1.  **Add outcomes to patients:** join `patient` → `patient_year` **by `id.patient`**.
-2.  **Attach practice covariates:** join with `practice` **by `id.practice`**.
-3.  **Attach practice-year treatment & context:** join with `practice_year` **by `c(id.practice, year)`**.
-4.  **Drop practice-level `Y`** to avoid ambiguity.
+Below we show the **first 3 rows** of each file for `replicate =` `r sprintf("%04d", as.integer(params$replicate_id))`.
+
+````{r preview-first-rows}
+# ---- File paths ----
+base_dir <- params$data_dir
+rid      <- sprintf("%04d", as.integer(params$replicate_id))
+
+dir_patient       <- fs::path(base_dir, "patient")
+dir_patient_year  <- fs::path(base_dir, "patient_year")
+dir_practice      <- fs::path(base_dir, "practice")
+dir_practice_year <- fs::path(base_dir, "practice_year")
+
+fname <- function(prefix) glue("acic_{prefix}_{rid}.csv")
+paths <- list(
+  patient       = fs::path(dir_patient,       fname("patient")),
+  patient_year  = fs::path(dir_patient_year,  fname("patient_year")),
+  practice      = fs::path(dir_practice,      fname("practice")),
+  practice_year = fs::path(dir_practice_year, fname("practice_year"))
+)
+
+# ---- A function to fall back to the provided sample ----
+show_head_or_fallback <- function(path, fallback_block, n = 3) {
+  if (fs::file_exists(path)) {
+    cat(glue("**File:** `{fs::path_file(path)}`  \n"))
+    x <- readr::read_csv(path, n_max = n, show_col_types = FALSE, progress = FALSE)
+    print(knitr::kable(
+      x,
+      format = ifelse(knitr::is_latex_output(), "latex", "simple"),
+      booktabs = knitr::is_latex_output(),
+      align = "l"
+    ))
+  } else {
+    cat(glue("**File not found locally, showing provided sample instead:** `{fs::path_file(path)}`  \n\n"))
+    cat("```\n")
+    cat(fallback_block)
+    cat("\n```\n\n")
+  }
+}
+
+# ---- Provided samples (first lines) ----
+sample_patient <- "id.patient\tid.practice\tV1\tV2\tV3\tV4\tV5
+1\t1\t14.526\t3\t0\t1.85\tB
+2\t1\t7.451\t4\t0\t0.07\tA
+3\t1\t17.301\t1\t1\t1.583\tA"
+
+sample_patient_year <- "id.patient\tyear\tY
+1\t1\t3625.524311
+2\t1\t395.6187556
+3\t1\t611.5372043"
+
+sample_practice <- "id.practice\tX1\tX2\tX3\tX4\tX5\tX6\tX7\tX8\tX9
+1\t0\tA\t1\tA\t1\t20.774\t14.153\t0.161\t43.432
+2\t0\tA\t0\tC\t0\t33.566\t3.285\t0.557\t12.722
+3\t0\tC\t1\tA\t1\t57.283\t11.178\t0.257\t-7.353"
+
+sample_practice_year <- "id.practice\tyear\tY\tZ\tpost\tn.patients\tV1_avg\tV2_avg\tV3_avg\tV4_avg\tV5_A_avg\tV5_B_avg\tV5_C_avg
+1\t1\t765.9213094\t0\t0\t2716\t11.576\t2.977\t0.514\t-0.087\t0.762\t0.19\t0.047
+1\t2\t976.9141846\t0\t0\t2782\t11.46\t2.964\t0.517\t-0.064\t0.767\t0.185\t0.048
+1\t3\t1131.252587\t0\t1\t2595\t11.45\t2.981\t0.513\t-0.072\t0.765\t0.187\t0.048"
+
+# ---- Print previews ----
+cat("### `patient_XXXX.csv`\n\n")
+show_head_or_fallback(paths$patient, sample_patient)
+
+cat("### `patient_year_XXXX.csv`\n\n")
+show_head_or_fallback(paths$patient_year, sample_patient_year)
+
+cat("### `practice_XXXX.csv`\n\n")
+show_head_or_fallback(paths$practice, sample_practice)
+
+cat("### `practice_year_XXXX.csv`\n\n")
+show_head_or_fallback(paths$practice_year, sample_practice_year)
+````
+
+# Merge Rules
+
+1. **Add outcomes to patients:** join `patient` → `patient_year` by `id.patient`.
+2. **Attach practice covariates:** join with `practice` by `id.practice`.
+3. **Attach practice-year treatment and context:** join with `practice_year` by `c(id.practice, year)`.
+4. **Drop practice-level `Y`** to avoid ambiguity.
 
 ```{r load-and-merge, eval=FALSE}
 # ---- Parameters ----
@@ -79,10 +173,7 @@ files <- list(
   practice_year = fs::path(dir_practice_year, fname("practice_year"))
 )
 
-# ---- Null-coalescing helper ----
-`%||%` <- function(a, b) if (is.null(a)) b else a
-
-# ---- Column specs (adjust if your files differ) ----
+# ---- Column specs ----
 colspec_patient_readr <- readr::cols(
   id.patient  = readr::col_integer(),
   id.practice = readr::col_integer(),
@@ -119,10 +210,17 @@ colspec_practice_year_readr <- readr::cols(
   Z           = readr::col_integer(),
   post        = readr::col_integer(),
   n.patients  = readr::col_integer(),
-  .default    = readr::col_double()    # covers V*_avg or V*_C
+  V1_avg      = readr::col_double(),
+  V2_avg      = readr::col_double(),
+  V3_avg      = readr::col_double(),
+  V4_avg      = readr::col_double(),
+  V5_A_avg    = readr::col_double(),
+  V5_B_avg    = readr::col_double(),
+  V5_C_avg    = readr::col_double()
 )
 
 # ---- Reader wrapper ----
+`%||%` <- function(a, b) if (!is.null(a)) a else b
 read_csv_smart <- function(path, spec_readr = NULL) {
   switch(read_engine,
     readr = readr::read_csv(path, col_types = spec_readr %||% readr::cols(), show_col_types = FALSE),
@@ -132,12 +230,6 @@ read_csv_smart <- function(path, spec_readr = NULL) {
   )
 }
 
-# ---- Safety checks ----
-missing <- names(files)[!fs::file_exists(unname(files))]
-if (length(missing)) {
-  stop(glue("Missing files for rid={rid}: {paste(missing, collapse=', ')} under base_dir='{base_dir}'."))
-}
-
 # ---- Read ----
 patient       <- read_csv_smart(files$patient,       colspec_patient_readr)
 patient_year  <- read_csv_smart(files$patient_year,  colspec_patient_year_readr)
@@ -145,42 +237,232 @@ practice      <- read_csv_smart(files$practice,      colspec_practice_readr)
 practice_year <- read_csv_smart(files$practice_year, colspec_practice_year_readr)
 
 # ---- Merge 1: keep observed patient-years only ----
-d <- patient %>%
-  inner_join(patient_year, by = "id.patient")  # ensures 'year' exists
+df <- patient %>%
+  inner_join(patient_year, by = "id.patient")
 
 # ---- Merge 2: + practice (X1–X9) ----
-d <- d %>%
+df <- df %>%
   left_join(practice, by = "id.practice")
 
 # ---- Merge 3: + practice_year (Z, post, aggregates) ----
-d <- d %>%
+df <- df %>%
   left_join(practice_year, by = c("id.practice", "year"), suffix = c("", ".practice"))
 
 # ---- Keep only the patient-level Y ----
-d <- d %>% select(-any_of("Y.practice"))
+df <- df %>% select(-any_of("Y.practice"))
 
 # ---- Basic checks ----
-stopifnot(all(c("id.patient","id.practice","year","Y","Z","post") %in% names(d)))
-stopifnot(!any(is.na(d$year)))
-glue::glue("Rows: {nrow(d)}, Patients: {dplyr::n_distinct(d$id.patient)}, Practices: {dplyr::n_distinct(d$id.practice)}") |> message()
+stopifnot(all(c("id.patient","id.practice","year","Y","Z","post") %in% names(df)))
+stopifnot(!any(is.na(df$year)))
+message(glue("Rows: {nrow(df)}, Patients: {dplyr::n_distinct(df$id.patient)}, Practices: {dplyr::n_distinct(df$id.practice)}"))
 
 # Quick peek
-dplyr::glimpse(d, width = 80)
+dplyr::glimpse(df, width = 80)
 ```
 
-# 4. Variable Roles in Modeling
+# Assign concrete meanings and recode (for readable strata)
 
-| Variable | Level | Typical role |
-|------------------|------------------|------------------------------------|
-| `Y` (patient-level) | Patient–Year | **Outcome** (monthly avg expenditure by year). |
-| `Z` | Practice–Year | **Treatment assignment** (cluster-RCT at practice-year level). |
-| `post` | Practice–Year | Post-intervention period indicator. |
-| `V1–V5` | Patient | Individual covariates (heterogeneity / adjustment / interactions). |
-| `X1–X9` | Practice | Time-invariant practice context (between-cluster differences). |
-| `V*_avg` or `V*_C`, `n.patients` | Practice–Year | Time-varying context / scale, useful for trend control. |
+We now **assign clear interpretations** to abstract variables and **recode** where appropriate. These are **teaching assumptions** for readability.
+
+```{r semantics-table}
+semantics <- tribble(
+  ~Variable, ~`Meaning (teaching assumption)`,
+  "V1", "Baseline risk score (continuous) — recoded into quartiles: Low / Medium / High / Very High.",
+  "V2", "Comorbidity grade (integer) — banded to: 0–1 / 2–3 / 4–5 / 6–7.",
+  "V3", "Sex at registration (binary) — 0 = Male, 1 = Female.",
+  "V4", "Deprivation index (continuous) — recoded into tertiles: Low / Mid / High.",
+  "V5", "Insurance plan (categorical A/B/C) — labelled: Plan A / Plan B / Plan C.",
+  "X1", "Rurality (binary) — 0 Urban, 1 Rural.",
+  "X2", "Region class (A/B/C).",
+  "X3", "Teaching practice (binary) — 0 No, 1 Yes.",
+  "X4", "Ownership type (A/B/C).",
+  "X5", "Urgent care facility (binary) — 0 No, 1 Yes.",
+  "X6–X9", "Practice metrics (continuous) — used as controls (not in strata).",
+  "Z", "Treatment assignment at practice–year.",
+  "post", "Post-intervention period indicator."
+)
+
+kable(
+  semantics,
+  format = ifelse(knitr::is_latex_output(), "latex", "simple"),
+  booktabs = knitr::is_latex_output(),
+  align = "l",
+  caption = "Human-readable teaching semantics for ACIC variables"
+)
+```
+
+```{r recode-and-strata, eval=FALSE}
+# This chunk assumes df exists from the merge step.
+
+label_patient_vars <- function(dat){
+  dat %>%
+    mutate(
+      # V1: baseline risk → quartiles (cut by sample quantiles)
+      V1_band = cut(
+        V1,
+        breaks = quantile(V1, probs = seq(0, 1, 0.25), na.rm = TRUE),
+        include.lowest = TRUE, dig.lab = 6
+      ),
+      V1_band = forcats::fct_recode(
+        V1_band,
+        "Risk: Low (Q1)"       = levels(V1_band)[1],
+        "Risk: Medium (Q2)"    = levels(V1_band)[2],
+        "Risk: High (Q3)"      = levels(V1_band)[3],
+        "Risk: Very High (Q4)" = levels(V1_band)[4]
+      ),
+
+      # V2: comorbidity grade → bands
+      V2_band = case_when(
+        V2 <= 1          ~ "Comorbidity: 0–1",
+        V2 %in% 2:3      ~ "Comorbidity: 2–3",
+        V2 %in% 4:5      ~ "Comorbidity: 4–5",
+        V2 >= 6          ~ "Comorbidity: 6–7",
+        TRUE             ~ NA_character_
+      ) |> factor(),
+
+      # V3: sex (0=Male, 1=Female)
+      sex = factor(if_else(V3 == 1, "Female", "Male"),
+                   levels = c("Male","Female"),
+                   labels = c("Sex: Male","Sex: Female")),
+
+      # V4: deprivation index → tertiles
+      V4_band = cut(
+        V4,
+        breaks = quantile(V4, probs = c(0, 1/3, 2/3, 1), na.rm = TRUE),
+        include.lowest = TRUE, dig.lab = 6
+      ),
+      V4_band = forcats::fct_recode(
+        V4_band,
+        "Deprivation: Low"  = levels(V4_band)[1],
+        "Deprivation: Mid"  = levels(V4_band)[2],
+        "Deprivation: High" = levels(V4_band)[3]
+      ),
+
+      # V5: plan labels
+      plan = forcats::fct_recode(factor(V5),
+                        "Plan: A" = "A",
+                        "Plan: B" = "B",
+                        "Plan: C" = "C")
+    )
+}
+
+# Apply patient-side labelling
+df <- df %>% label_patient_vars()
+
+# practice-side readable labels (useful for descriptives)
+df <- df %>%
+  mutate(
+    rurality = factor(if_else(X1 == 1, "Rural", "Urban"),
+                      levels = c("Urban","Rural"),
+                      labels = c("Rurality: Urban","Rurality: Rural")),
+    region   = forcats::fct_recode(factor(X2),
+                          "Region: A" = "A",
+                          "Region: B" = "B",
+                          "Region: C" = "C"),
+    teaching = factor(if_else(X3 == 1, "Yes", "No"),
+                      levels = c("No","Yes"),
+                      labels = c("Teaching practice: No","Teaching practice: Yes")),
+    owner    = forcats::fct_recode(factor(X4),
+                          "Ownership: A" = "A",
+                          "Ownership: B" = "B",
+                          "Ownership: C" = "C"),
+    urgent   = factor(if_else(X5 == 1, "Yes", "No"),
+                      levels = c("No","Yes"),
+                      labels = c("Urgent care: No","Urgent care: Yes"))
+  )
+
+# Construct human-readable strata (patient-side only)
+df <- df %>%
+  mutate(
+    strata_label = interaction(sex, V1_band, V2_band, V4_band, plan,
+                               sep = " | ", drop = TRUE) |> forcats::fct_drop(),
+    # A compact version for charts
+    strata_short = glue::glue(
+      "{ifelse(sex=='Sex: Female','F','M')} | ",
+      "{forcats::fct_collapse(V1_band, Low='Risk: Low (Q1)', Med='Risk: Medium (Q2)', High=c('Risk: High (Q3)','Risk: Very High (Q4)'))} | ",
+      "{stringr::str_replace(V2_band,'Comorbidity: ','C: ')} | ",
+      "{stringr::str_replace(V4_band,'Deprivation: ','Dep: ')} | ",
+      "{stringr::str_replace(plan,'Plan: ','P ')}"
+    )
+  )
+
+# Quick checks
+message("Preview of labelled variables and strata:")
+df %>%
+  dplyr::select(id.patient, year, Y, Z, post, sex, V1_band, V2_band, V4_band, plan, strata_label) %>%
+  head(8) %>% print(n=8)
+```
+
+# Quick descriptive: strata size and mean outcome
+
+```{r strata-descriptives, eval=FALSE}
+# Summarise strata sizes and mean outcome 
+strata_summary <- df %>%
+  group_by(strata_label) %>%
+  summarise(
+    n = n(),
+    patients = n_distinct(id.patient),
+    practices = n_distinct(id.practice),
+    mean_Y = mean(Y, na.rm = TRUE),
+    mean_Z = mean(Z, na.rm = TRUE)
+  ) %>%
+  arrange(desc(n))
+
+kable(
+  head(strata_summary, 15),
+  format = ifelse(knitr::is_latex_output(), "latex", "simple"),
+  booktabs = knitr::is_latex_output(),
+  caption = "Top strata by size (n), with mean outcome and exposure rate"
+)
+```
+
+# Variable Roles in Modelling
+
+````{r acic_variables}
+vrm <- tribble(
+  ~Variable,       ~Level,                         ~Origin,                       ~Original,                                                    ~Teaching,
+  "Y",             "Patient-Year",                 "patient_year_xxxx.csv",       "Patient annual outcome (continuous numeric).",              "Outcome: monthly average medical expenditure for that patient and year; Track-1 outcome variable.",
+  "Z",             "Practice-Year",                "practice_year_xxxx.csv",      "Cluster-level treatment assignment (0/1).",                 "Treatment indicator: whether the practice received the intervention (1 treated, 0 control).",
+  "post",          "Practice-Year",                "practice_year_xxxx.csv",      "Post-intervention time indicator.",                         "Post-period flag: 1 after intervention, 0 before; used for time interactions / DiD.",
+  "V1",            "Patient",                      "patient_xxxx.csv",            "Continuous patient covariate (abstract).",                  "Baseline risk score: recoded into quartiles (Low / Medium / High / Very High).",
+  "V2",            "Patient",                      "patient_xxxx.csv",            "Discrete numeric covariate (small integer range).",         "Comorbidity grade: banded 0-1 / 2-3 / 4-5 / 6-7.",
+  "V3",            "Patient",                      "patient_xxxx.csv",            "Binary indicator (0/1).",                                   "Sex at registration: 0 Male, 1 Female; labelled as factors.",
+  "V4",            "Patient",                      "patient_xxxx.csv",            "Continuous numeric covariate.",                             "Deprivation index: recoded into tertiles (Low / Mid / High).",
+  "V5",            "Patient",                      "patient_xxxx.csv",            "Categorical variable (A/B/C).",                             "Insurance plan: Plan A / Plan B / Plan C (used for strata).",
+  "X1",            "Practice",                     "practice_xxxx.csv",           "Binary covariate (0/1).",                                   "Rurality: 0 Urban, 1 Rural.",
+  "X2",            "Practice",                     "practice_xxxx.csv",           "Categorical covariate (A/B/C).",                            "Region class: Region A / Region B / Region C.",
+  "X3",            "Practice",                     "practice_xxxx.csv",           "Binary covariate (0/1).",                                   "Teaching practice: 0 No, 1 Yes.",
+  "X4",            "Practice",                     "practice_xxxx.csv",           "Categorical covariate (A/B/C).",                            "Ownership type: Ownership A / B / C.",
+  "X5",            "Practice",                     "practice_xxxx.csv",           "Binary covariate (0/1).",                                   "Urgent-care facility: 0 No, 1 Yes.",
+  "X6–X9",         "Practice",                     "practice_xxxx.csv",           "Continuous practice-level covariates.",                     "Practice metrics: contextual measures (e.g., staff experience, mean income, patient mix); controls.",
+  "V1_avg–V4_avg", "Practice-Year",                "practice_year_xxxx.csv",      "Practice-year means of V1–V4.",                             "Practice-year averages of risk, comorbidity, deprivation, etc.; contextual covariates.",
+  "V5_A_avg etc.", "Practice-Year",                "practice_year_xxxx.csv",      "Proportions of V5 categories (A/B/C).",                     "Practice-year category shares: proportion in Plan A / Plan B / Plan C.",
+  "n.patients",    "Practice-Year",                "practice_year_xxxx.csv",      "Number of patients in the practice that year.",             "Practice-year sample size: for weighting/scaling aggregated statistics.",
+  "id.patient",    "Patient / Patient-Year",       "all joined tables",           "Unique patient identifier.",                                 "Merge key; level-1 random effect in multilevel models.",
+  "id.practice",   "Practice / Practice-Year",     "all joined tables",           "Unique practice (cluster) identifier.",                      "Merge key; level-2 (cluster) random effect.",
+  "year",          "Patient-Year / Practice-Year", "patient_year / practice_year","Observation time index (integer).",                          "Year of observation: defines longitudinal sequences."
+)
+
+if (knitr::is_html_output()) {
+  suppressPackageStartupMessages(library(DT))
+  DT::datatable(
+    vrm,
+    rownames = FALSE,
+    options = list(pageLength = 25, scrollX = TRUE),
+    caption = htmltools::tags$caption(style = 'caption-side: top; text-align: left;',
+                                      'Variable Roles in Modelling (Expanded Explanation)')
+  )
+} else {
+  txt <- paste(capture.output(print(vrm, n = nrow(vrm), width = Inf)), collapse = "\n")
+  cat("**Variable Roles in Modelling (Expanded Explanation)**\n\n")
+  cat("```\n"); cat(txt); cat("\n```\n")
+}
+````
 
 **Common pitfalls**
 
--   Don’t mix the two `Y`s—use **patient** `Y` for Track-1.
--   Join keys must align: `id.patient`, `id.practice`, `year`.
--   Patients won’t appear in every year; this is **by design**, not missingness.
+* Do **not** mix the two `Y`s — use **patient `Y`** for Track-1.
+* Join keys must align: `id.patient`, `id.practice`, `year`.
+* Patients do not appear in every year; this is **by design** (ageing in/out, death), not missingness.
+
+
