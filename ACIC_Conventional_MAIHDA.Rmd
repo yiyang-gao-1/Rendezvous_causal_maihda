@@ -16,7 +16,8 @@ header-includes:
   - \usepackage{booktabs}
   - \usepackage{longtable}
   - \usepackage{array}
-  - \usepackage[stretch=10]{microtype}
+  - \microtypesetup{stretch=10}
+
 ---
 
 
@@ -469,43 +470,53 @@ invisible(NULL)
 # VPC for Model B and slope heterogeneity for Model C
 
 ```{r vpc}
-# Extract variance components from Model B
+
+# Pull variance components as a data frame from Model B
 vcB_df <- as.data.frame(VarCorr(mB))
 
-get_vc <- function(vdf, group, var1, var2 = NA) {
-  out <- vdf$vcov[vdf$grp == group & vdf$var1 == var1 &
-                    (is.na(vdf$var2) == is.na(var2)) &
-                    ((vdf$var2 %||% NA) == (var2 %||% NA))]
-  if (length(out) == 0) 0 else out[1]
+# Helper: get diagonal variance for a given group/term (var2 must be NA on the diagonal)
+get_var <- function(vdf, group, term) {
+  out <- vdf$vcov[vdf$grp == group & vdf$var1 == term & is.na(vdf$var2)]
+  if (length(out) == 0) NA_real_ else out[1]
 }
 
-v_strata_B <- get_vc(vcB_df, "strata_label", "(Intercept)")  # between-stratum variance
-v_practice <- get_vc(vcB_df, "id.practice",  "(Intercept)")  # practice variance
-v_patient  <- get_vc(vcB_df, "id.patient",   "(Intercept)")  # patient variance
-v_resid_B  <- tryCatch(as.numeric(sigma(mB))^2, error = function(e) NA_real_)  # residual variance
+# Model B: variances
+v_strata_B <- get_var(vcB_df, "strata_label", "(Intercept)")   # between-stratum variance
+v_practice <- get_var(vcB_df, "id.practice",  "(Intercept)")   # practice variance
+v_patient  <- get_var(vcB_df, "id.patient",   "(Intercept)")   # patient variance
+v_resid_B  <- tryCatch(as.numeric(sigma(mB))^2, error = function(e) NA_real_)
 
-# VPC that includes all random components in the denominator
-V_total_B     <- sum(v_strata_B, v_practice, v_patient, v_resid_B, na.rm = TRUE)
-VPC_strata_B  <- if (is.finite(V_total_B) && V_total_B > 0) v_strata_B / V_total_B else NA_real_
+# VPC (denominator includes all random parts)
+V_total_B    <- sum(v_strata_B, v_practice, v_patient, v_resid_B, na.rm = TRUE)
+VPC_strata_B <- if (is.finite(V_total_B) && V_total_B > 0) v_strata_B / V_total_B else NA_real_
 
-# VPC using only strata and residual in the denominator (for comparison)
-VPC_strata_canonical <- if (is.finite(v_strata_B) && is.finite(v_resid_B) &&
-                             (v_strata_B + v_resid_B) > 0) {
+# Tutorial (canonical) VPC (denominator = strata + residual only)
+VPC_strata_canonical <- if (all(is.finite(c(v_strata_B, v_resid_B))) &&
+                            (v_strata_B + v_resid_B) > 0) {
   v_strata_B / (v_strata_B + v_resid_B)
 } else NA_real_
 
-# From Model C: standard deviation of the Wc random slope and the intercept–slope correlation
+# Model C: slope heterogeneity
 vcC_df <- as.data.frame(VarCorr(mC))
-sd_W   <- sqrt(get_vc(vcC_df, "strata_label", "Wc"))
-sd_int <- sqrt(get_vc(vcC_df, "strata_label", "(Intercept)"))
-cov_iw <- vcC_df$vcov[vcC_df$grp=="strata_label" & vcC_df$var1=="(Intercept)" & vcC_df$var2=="Wc"]
-cov_iw <- if (length(cov_iw)) cov_iw[1] else NA_real_
-corr_iw <- if (is.finite(sd_W) && is.finite(sd_int) && sd_W>0 && sd_int>0) cov_iw/(sd_W*sd_int) else NA_real_
+sd_W   <- sqrt(get_var(vcC_df, "strata_label", "Wc"))          # may be NA if no Wc term
+sd_int <- sqrt(get_var(vcC_df, "strata_label", "(Intercept)")) # NA if slope-only model
 
-# Report the two VPCs for clarity
+# Intercept–slope covariance exists only when both terms are present
+cov_iw <- vcC_df$vcov[vcC_df$grp == "strata_label" &
+                      vcC_df$var1 == "(Intercept)" &
+                      vcC_df$var2 == "Wc"]
+cov_iw <- if (length(cov_iw)) cov_iw[1] else NA_real_
+
+# Correlation only if both variances are positive and finite
+corr_iw <- if (is.finite(sd_W) && is.finite(sd_int) && sd_W > 0 && sd_int > 0) {
+  cov_iw / (sd_W * sd_int)
+} else NA_real_
+
+# Report
 knitr::kable(
   tibble::tibble(
-    quantity = c("VPC (canonical, strata and residual only)", "VPC (design-faithful, all random parts)"),
+    quantity = c("VPC (canonical, strata and residual only)",
+                 "VPC (design-faithful, all random parts)"),
     value    = round(c(VPC_strata_canonical, VPC_strata_B), 4)
   ),
   format   = ifelse(knitr::is_latex_output(), "latex", "simple"),
@@ -514,6 +525,7 @@ knitr::kable(
 )
 
 invisible(NULL)
+
 ```
 
 # Caterpillars (random intercepts and random slopes)
