@@ -71,7 +71,7 @@ Run `02_conventional_maihda.Rmd` to perform traditional MAIHDA analysis. This wi
 - Calculate VPC to quantify between-stratum heterogeneity
 - Fit multilevel models and assess treatment effect variation
 
-### Step 3: Causal Extensions (Optional) ⚡
+### Step 3: Causal Extensions ⚡
 For causal inference extensions, run `03_causal_maihda.Rmd`. Ensure you have saved the merged dataset from Step 2 (the script saves it as `causal_acic.csv`).
 
 ### Step 4: Finding High-VPC Replicates (Optional) 🎯
