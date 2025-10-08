@@ -519,109 +519,97 @@ invisible(NULL)
 # Caterpillars (random intercepts and random slopes)
 
 ```{r caterpillars, fig.width=7, fig.height=5}
-# Notes:
-# - CI calculation needs condVar=TRUE, which can be heavy for thousands of strata.
-# - We auto-disable CIs when groups are large (thresholds below).
-# - Figures are saved as PNG via knitr's device to keep memory down.
+# --- Lightweight caterpillars: sample a subset, no CI ------------
 
-# thresholds you can tune
-th_ci_strata  <- 800   # if number of strata <= this, compute CIs for intercepts
-th_ci_slope   <- 400   # if number of strata <= this, compute CIs for slopes
+MAX_STRATA_B   <- 50    # how many strata to show for Model B (intercepts)
+MAX_STRATA_C   <- 50    # how many strata to show for Model C (slopes)
+SELECT_METHOD  <- "top"    # "top" = largest by size, "random" = random sample
+SEED_FOR_PLOTS <- 2025     # set a seed for reproducible sampling
 
-J_strata <- nlevels(df$strata_label)
+# Pre-compute stratum sizes (used to pick "top" strata)
+sizes <- df %>% dplyr::count(strata_label, name = "n")
 
-# ---------- Model B: strata random intercept caterpillar ----------
-use_ci_B <- J_strata <= th_ci_strata
-
-if (use_ci_B) {
-  rrB <- lme4::ranef(mB, condVar = TRUE)
-  reB <- rrB$strata_label
-  pvB <- attr(rrB$strata_label, "postVar")  # 1 x 1 x J array for random intercept only
-  seB <- sqrt(sapply(1:dim(pvB)[3], function(j) pvB[,,j]))
-
-  cat_df_B <- tibble::tibble(
-    stratum = rownames(reB),
-    effect  = reB[,"(Intercept)"],
-    ciL     = effect - 1.96*seB,
-    ciU     = effect + 1.96*seB
-  ) %>% arrange(effect) %>% mutate(idx = row_number())
-
-  ggplot(cat_df_B, aes(x = idx, y = effect)) +
-    geom_hline(yintercept = 0, linetype = 3) +
-    geom_errorbar(aes(ymin = ciL, ymax = ciU), width = 0) +
-    geom_point(size = 0.6) +
-    labs(title = "Caterpillar: strata random intercepts (Model B)",
-         subtitle = "95% CIs shown (few strata → full CI calculation)",
-         x = "Strata (ordered)", y = "BLUP (centred)") +
-    theme_minimal()
-} else {
-  # fast path: no CI
-  reB <- lme4::ranef(mB, condVar = FALSE)$strata_label
-  cat_df_B <- tibble::tibble(
-    stratum = rownames(reB),
-    effect  = reB[,"(Intercept)"]
-  ) %>% arrange(effect) %>% mutate(idx = row_number())
-
-  ggplot(cat_df_B, aes(x = idx, y = effect)) +
-    geom_hline(yintercept = 0, linetype = 3) +
-    geom_point(size = 0.4) +
-    labs(title = "Caterpillar: strata random intercepts (Model B)",
-         subtitle = "CIs omitted for speed (many strata)",
-         x = "Strata (ordered)", y = "BLUP (centred)") +
-    theme_minimal()
+# Helper: choose a subset of rows by "top" or "random"
+choose_subset <- function(dat, n_show, method = c("top","random")) {
+  method <- match.arg(method)
+  if (nrow(dat) <= n_show) return(dat)
+  if (method == "top") {
+    dat %>% dplyr::slice_max(order_by = n, n = n_show, with_ties = FALSE)
+  } else {
+    set.seed(SEED_FOR_PLOTS)
+    dat %>% dplyr::slice_sample(n = n_show)
+  }
 }
 
-# ---------- Model C: strata random slope for Wc ----------
-# We first check whether the fitted mC actually has a slope term named "Wc".
-reC_list <- try(lme4::ranef(mC), silent = TRUE)
-has_Wc <- !(inherits(reC_list, "try-error")) &&
-          ("strata_label" %in% names(reC_list)) &&
-          any(colnames(reC_list$strata_label) == "Wc")
+# ---------------- Model B: strata random intercept caterpillar (no CI) --------
+reB_list <- try(lme4::ranef(mB, condVar = FALSE), silent = TRUE)
 
-if (has_Wc) {
-  use_ci_C <- (J_strata <= th_ci_slope)
+if (!inherits(reB_list, "try-error") && "strata_label" %in% names(reB_list)) {
+  reB <- reB_list$strata_label
+  cat_df_B <- tibble::tibble(
+    stratum = rownames(reB),
+    effect  = reB[, "(Intercept)"]
+  ) %>%
+    dplyr::left_join(sizes, by = dplyr::join_by(stratum == strata_label)) %>%
+    dplyr::mutate(n = n %||% 0L)
 
-  if (use_ci_C) {
-    rrC <- lme4::ranef(mC, condVar = TRUE)
-    reC <- rrC$strata_label
-    pvC <- attr(rrC$strata_label, "postVar")     # 2 x 2 x J or 1 x 1 x J depending on RE structure
-    w_idx <- which(colnames(reC) == "Wc")
-    seW   <- sqrt(sapply(1:dim(pvC)[3], function(j) pvC[w_idx, w_idx, j]))
+  # pick subset
+  cat_df_B_sub <- choose_subset(cat_df_B, MAX_STRATA_B, method = SELECT_METHOD) %>%
+    dplyr::arrange(effect) %>%
+    dplyr::mutate(idx = dplyr::row_number())
+
+  # plot
+  ggplot(cat_df_B_sub, aes(x = idx, y = effect)) +
+    geom_hline(yintercept = 0, linetype = 3) +
+    geom_point(size = 0.45) +
+    labs(
+      title    = "Caterpillar: strata random intercepts (Model B)",
+      subtitle = paste0("Showing ", nrow(cat_df_B_sub), " of ", nrow(cat_df_B), " strata (", SELECT_METHOD, ")"),
+      x = "Strata (ordered subset)", y = "BLUP (centred)"
+    ) +
+    theme_minimal()
+} else {
+  cat("Note: Model B random intercepts for strata not available; skipped.\n")
+}
+
+# ---------------- Model C: strata random slope for Wc (no CI) -----------------
+reC_list <- try(lme4::ranef(mC, condVar = FALSE), silent = TRUE)
+has_strata <- !(inherits(reC_list, "try-error")) && ("strata_label" %in% names(reC_list))
+
+if (has_strata) {
+  reC <- reC_list$strata_label
+
+  # column name for the slope (allow either 'Wc' or 'W' depending on your final spec)
+  slope_col <- intersect(colnames(reC), c("Wc","W"))
+  if (length(slope_col) == 1) {
+    slope_col <- slope_col[1]
 
     catW <- tibble::tibble(
       stratum = rownames(reC),
-      slope   = reC[,"Wc"],
-      ciL     = slope - 1.96*seW,
-      ciU     = slope + 1.96*seW
-    ) %>% arrange(slope) %>% mutate(idx = row_number())
+      slope   = reC[, slope_col]
+    ) %>%
+      dplyr::left_join(sizes, by = dplyr::join_by(stratum == strata_label)) %>%
+      dplyr::mutate(n = n %||% 0L)
 
-    ggplot(catW, aes(x = idx, y = slope)) +
+    # pick subset
+    catW_sub <- choose_subset(catW, MAX_STRATA_C, method = SELECT_METHOD) %>%
+      dplyr::arrange(slope) %>%
+      dplyr::mutate(idx = dplyr::row_number())
+
+    ggplot(catW_sub, aes(x = idx, y = slope)) +
       geom_hline(yintercept = 0, linetype = 3) +
-      geom_errorbar(aes(ymin = ciL, ymax = ciU), width = 0) +
-      geom_point(size = 0.6) +
-      labs(title = "Caterpillar: strata random slope for Wc (Model C)",
-           subtitle = "95% CIs shown (few strata → full CI calculation)",
-           x = "Strata (ordered)", y = "Deviation from overall Wc effect") +
+      geom_point(size = 0.45) +
+      labs(
+        title    = paste0("Caterpillar: strata random slope for ", slope_col, " (Model C)"),
+        subtitle = paste0("Showing ", nrow(catW_sub), " of ", nrow(catW), " strata (", SELECT_METHOD, ")"),
+        x = "Strata (ordered subset)", y = paste0("Deviation from overall ", slope_col, " effect")
+      ) +
       theme_minimal()
   } else {
-    # fast path: no CI
-    reC <- lme4::ranef(mC, condVar = FALSE)$strata_label
-    catW <- tibble::tibble(
-      stratum = rownames(reC),
-      slope   = reC[,"Wc"]
-    ) %>% arrange(slope) %>% mutate(idx = row_number())
-
-    ggplot(catW, aes(x = idx, y = slope)) +
-      geom_hline(yintercept = 0, linetype = 3) +
-      geom_point(size = 0.4) +
-      labs(title = "Caterpillar: strata random slope for Wc (Model C)",
-           subtitle = "CIs omitted for speed (many strata)",
-           x = "Strata (ordered)", y = "Deviation from overall Wc effect") +
-      theme_minimal()
+    cat("Note: Model C does not contain a 'Wc' (or 'W') random slope for strata; slope caterpillar skipped.\n")
   }
 } else {
-  # If no Wc random slope (e.g., slope-only model not present or named differently), skip politely
-  cat("Note: Model C does not contain a 'Wc' random slope for strata; slope caterpillar skipped.\n")
+  cat("Note: Model C random effects for strata not available; skipped.\n")
 }
 
 invisible(NULL)
