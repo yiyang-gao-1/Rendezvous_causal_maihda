@@ -1,231 +1,352 @@
+---
+title: "Causal‑MAIHDA on ACIC‑2022 Track 1 (Practice‑level RCT)"
+author: "Yiyang Gao"
+date: "`r format(Sys.Date())`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+  pdf_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+params:
+  # If you already saved a prepared analysis dataset (e.g., from the Conventional MAIHDA script),
+  # point to it here. We will try to read this first.
+  analysis_rds: "analysis_data.rds"
+  # Alternatively, set a directory to your ACIC Track 1 files and write your own loader below.
+  data_dir: null
+---
 
-# 5. Using Track 1 for MAIHDA and Causal Analysis
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(forcats)
+  library(ggplot2)
+  library(stringr)
+  library(tibble)
+  library(purrr)
+  library(lme4)
+  library(fixest)
+  library(broom)
+  library(grf)
+  library(clubSandwich)
+})
+theme_set(theme_minimal(base_size = 12))
+```
 
-\*\* In **ACIC 2022 Track 1 (Patient-Year Data)**, the **treatment (`Z`) is assigned at the *practice-level***, *not* at the individual-patient level. This supports:
+# 1) Big picture (plain language)
 
--   **Random-intercept MAIHDA** (e.g., practice as a random effect; intersections via patient covariates).
--   **Random-slope MAIHDA for Treatment** (allow treatment effect to vary across intersections/practices).
--   **Causal-Forest-MAIHDA**: Estimate heterogeneous treatment effects (patient-level ITEs) while clustering or post-modeling standard errors at practice.
+**Goal.** We want a *minimal, reproducible* demonstration of **Causal‑MAIHDA** using **ACIC‑2022 Track 1** where the **treatment `Z` is assigned at the practice (cluster) level**, and the outcome `Y` is at the patient‑year level.
 
-## 5.1 How treatment assignment works in ACIC Track 1
+**What we’ll show.**
+1. **Concepts in plain language**: Random Forest, Causal Forest, Bayesian‑MAIHDA.  
+2. **A working demo** on ACIC Track 1: 
+   - cluster‑robust **ATE** (intention‑to‑treat),  
+   - **random‑slope MAIHDA** for treatment heterogeneity across practices,  
+   - **Causal Forest** for *individual* or *subgroup* treatment heterogeneity (CATE/ITE) with clustering.  
+3. **How to handle self‑selection / opt‑out and do diagnostics** in a cluster‑randomized setting.
 
-From the official data structure:
+> **Design reminder.** In Track 1, *all* patients within a practice in a given year share the same `Z`. So identification comes from **between‑practice** differences (and over time), not from within‑practice variation.
 
-```{r data-structure-table, echo=FALSE}
-data_structure <- data.frame(
-  Level = c("practice_year", "practice_year", "patient_year"),
-  Variable = c("Z", "post", "Y"),
-  Meaning = c(
-    "Treatment indicator (1 = treated practice in that year, 0 = control)",
-    "Period indicator – marks post-intervention years",
-    "Patient's individual outcome (monthly expenditure)"
-  )
+---
+
+# 2) Concepts first — in very simple terms
+
+## 2.1 Random Forest (RF)
+- Think of many decision trees, each trained on a random slice of the data and features.  
+- Combine them to make a robust predictor (**handles nonlinearity and high‑order interactions** automatically).  
+- Great for *prediction*, but **not designed to answer causal “what if”** questions by itself.
+
+## 2.2 Causal Forest (CF)
+- A forest **built to estimate treatment effects**: average effect for individuals or subgroups (**CATE / ITE**).  
+- Uses clever tricks (sample‑splitting and orthogonalization) to reduce bias and over‑fitting.  
+- In R, we’ll use `grf::causal_forest`. Because Track 1 is **cluster randomized**, we will set `clusters = id.practice` so inference respects the design.
+
+## 2.3 Bayesian‑MAIHDA (very short overview)
+- MAIHDA is a **multilevel model** for intersectional heterogeneity (e.g., sex × ethnicity × income).  
+- In a **Bayesian** version, we put **hierarchical priors** on random effects so **small subgroups borrow strength** (partial pooling).  
+- For RCT‑MAIHDA, we model **practice random intercepts and treatment random slopes**, and (optionally) subgroup random effects, to capture how *treatment effects vary* across clusters and intersections — with **full posteriors**.
+
+> In this teaching demo we implement a frequentist random‑slope MAIHDA and a Causal Forest. Later you can swap to `brms`/`rstanarm` for a Bayesian MAIHDA variant.
+
+---
+
+# 3) Data entry point
+
+We assume you **already prepared** a cleaned analysis data table from the **Conventional MAIHDA** script. We try to read it first.
+
+- Required columns (rename as needed):  
+  `id.practice` (cluster id), `Z` (0/1 treatment), `Y` (outcome), `post` (0 pre, 1 post if present),  
+  patient‑level covariates `V1...V5` (or others), optional practice covariates `X*`.
+
+```{r load-data}
+# Option A: load a saved RDS created by your previous script
+d <- NULL
+if (!is.null(params$analysis_rds) && file.exists(params$analysis_rds)) {
+  d <- readRDS(params$analysis_rds)
+}
+
+# Option B: (template) write your own loader if you prefer to read from raw ACIC files
+if (is.null(d)) {
+  if (!is.null(params$data_dir)) {
+    stop("Please write your custom loader here using params$data_dir, or provide params$analysis_rds.")
+  } else {
+    stop("No data found. Provide params$analysis_rds (RDS with analysis table) or params$data_dir.")
+  }
+}
+
+# Sanity checks / minimal coercions
+stopifnot(all(c("id.practice","Z","Y") %in% names(d)))
+d <- d %>% mutate(
+  id.practice = as.factor(id.practice),
+  Z = as.integer(Z)
 )
-
-kable(data_structure, 
-      caption = "ACIC Track 1 Data Structure",
-      format = "html") %>%
-  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
-                full_width = FALSE) %>%
-  column_spec(1, bold = TRUE, color = "navy") %>%
-  column_spec(2, bold = TRUE)
+glimpse(d)
 ```
 
-So:
+**Tip.** If your prepared dataset has different column names (e.g., `idpr`, `treat`, `y_outcome`), change the code above and below accordingly.
 
--   Each **practice** is the *cluster* (the unit of randomization)
--   Within a practice, *all patients share the same treatment status Z* in a given year
--   Outcomes Y are measured for each **patient**, producing many individual responses per practice
+---
 
-This setup is the classic **cluster-randomised trial** (or "group-randomised RCT").
+# 4) Quick cluster‑robust ATE (Intention‑to‑Treat)
 
-# Implication for modeling
+```{r ate-cluster-robust}
+# Practice-level summary for intuition
+clu <- d %>% group_by(id.practice) %>%
+  summarise(Z = first(Z), Y_bar = mean(Y, na.rm=TRUE), n = n(), .groups="drop")
 
-## Multilevel interpretation
+ate_diff_means <- with(clu, mean(Y_bar[Z==1]) - mean(Y_bar[Z==0]))
+ate_diff_means
 
-Because patients are nested within practices:
-
--   **Level 1 (patients)**: individual heterogeneity — covariates V₁–V₅, outcomes Y
--   **Level 2 (practices)**: treatment assignment Z and contextual variables X₁–X₉
--   **Time dimension**: repeated measures (patient-year and practice-year)
-
-## ️5.2 Why this structure suits MAIHDA extensions
-
-```{r maihda-models-table, echo=FALSE}
-maihda_models <- data.frame(
-  Model = c(
-    "Random-intercept MAIHDA",
-    "Random-slope MAIHDA for Treatment",
-    "Causal-Forest-MAIHDA"
-  ),
-  What_it_does = c(
-    "Captures between-practice variability (cluster effects)",
-    "Allows treatment effect Z to vary across practices or across patient-level intersections (e.g., by sex × ethnicity × income)",
-    "Uses machine-learning (e.g., GRF) to estimate individual treatment effects (ITEs) while accounting for cluster structure"
-  ),
-  Why_appropriate_here = c(
-    "Practices differ in baseline outcomes",
-    "Treatment heterogeneity across clusters and subgroups",
-    "Estimates heterogeneous effects under cluster-level assignment; practice IDs can be used as clusters in grf::causal_forest"
-  )
-)
-
-kable(maihda_models, 
-      caption = "MAIHDA Model Extensions for Cluster-Randomized Data",
-      format = "html") %>%
-  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
-                full_width = FALSE) %>%
-  column_spec(1, bold = TRUE, width = "25%") %>%
-  column_spec(2, width = "35%") %>%
-  column_spec(3, width = "40%")
+# Cluster-robust regression at the individual level
+m_itt <- fixest::feols(Y ~ Z, data = d, cluster = ~ id.practice)
+fixest::etable(m_itt)
 ```
 
+> **Interpretation.** This is an **ITT** estimate: the effect of being *assigned* to treatment at the **practice** level. Standard errors are **clustered by practice** to respect the RCT design.
 
-## 5.3 Why we **can't** treat Z as individual-level
+---
 
-If we did, we would be violating the design: every patient in a given practice-year shares the same Z, so there's **no within-practice treatment variation**.
+# 5) Random‑slope MAIHDA for treatment heterogeneity
 
-That means:
+We allow the **treatment slope** to vary across practices: `(1 + Z | id.practice)`. Optionally, include interactions with patient covariates.
 
--   We cannot identify the effect of Z from patient-level variation alone
--   All identification comes from **between-practice** (and over-time) comparisons
--   Standard errors must be **cluster-robust** or modeled with random effects for `id.practice`
+```{r maihda-random-slope}
+# (Optional) build an intersectional "strata" (here we form an example from V1..V3)
+make_strata <- function(df, vars=c("V1","V2","V3"), k=3){
+  out <- df
+  for(v in vars){
+    if (v %in% names(out) && is.numeric(out[[v]])) {
+      out[[v]] <- cut(out[[v]], breaks=k, include.lowest = TRUE, ordered_result = TRUE)
+    } else if (!v %in% names(out)) {
+      warning(paste("Variable", v, "not found — skipped in strata."))
+    }
+  }
+  out$strata <- forcats::fct_cross(!!!rlang::syms(vars), sep="∙")
+  out
+}
 
-### Example code for proper modeling
+d <- make_strata(d, vars = intersect(names(d), c("V1","V2","V3")))
 
-```{r modeling-example, eval=FALSE}
-# Incorrect: Ignoring cluster structure
-wrong_model <- lm(Y ~ Z + V1 + V2 + V3 + V4 + V5, data = d)
-
-# Correct Option 1: Mixed effects model with practice random effects
-correct_model1 <- lmer(Y ~ Z + V1 + V2 + V3 + V4 + V5 + 
-                       (1 | id.practice), 
-                       data = d)
-
-# Correct Option 2: Fixed effects with cluster-robust SEs
-library(sandwich)
-library(lmtest)
-fe_model <- lm(Y ~ Z + V1 + V2 + V3 + V4 + V5 + 
-               factor(id.practice), 
-               data = d)
-coeftest(fe_model, vcov = vcovCL, cluster = ~ id.practice)
-
-# Correct Option 3: GRF with cluster specification
-library(grf)
-cf_model <- causal_forest(
-  X = as.matrix(d[, c("V1", "V2", "V3", "V4", "V5")]),
-  Y = d$Y,
-  W = d$Z,
-  clusters = d$id.practice
-)
-```
-
-
-
-## 5.4 Summary
-
-```{r summary-table, echo=FALSE}
-summary_concepts <- data.frame(
-  Concept = c(
-    "Treatment (Z)",
-    "Outcome (Y)",
-    "Covariates (V₁–V₅)",
-    "Context (X₁–X₉, V*_avg, n.patients)",
-    "Design type"
-  ),
-  Level = c(
-    "Practice-year (cluster level)",
-    "Patient-year (individual level)",
-    "Patient level",
-    "Practice or practice-year",
-    "Cluster-randomized longitudinal RCT"
-  )
-)
-
-kable(summary_concepts, 
-      caption = "Key Concepts and Their Levels",
-      format = "html") %>%
-  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
-                full_width = FALSE) %>%
-  column_spec(1, bold = TRUE, color = "darkblue") %>%
-  row_spec(1, bold = TRUE, background = "#f0f0f0")
-```
-
-
-## 5.5 Visualizing cluster structure
-
-```{r viz-clusters, eval=FALSE}
-# Visualize treatment assignment by practice
-library(ggplot2)
-
-practice_summary <- analysis_data %>%
-  group_by(id.practice, Z) %>%
-  summarise(
-    mean_outcome = mean(Y, na.rm = TRUE),
-    n_obs = n()
-  )
-
-ggplot(practice_summary, aes(x = factor(Z), y = mean_outcome)) +
-  geom_boxplot(aes(fill = factor(Z))) +
-  geom_jitter(alpha = 0.3, width = 0.1) +
-  scale_fill_manual(values = c("0" = "lightblue", "1" = "salmon"),
-                    labels = c("Control", "Treated")) +
-  labs(
-    title = "Distribution of Mean Outcomes by Practice Treatment Status",
-    x = "Treatment Status",
-    y = "Mean Patient Outcome",
-    fill = "Treatment"
-  ) +
-  theme_minimal()
-```
-
-Below is a lightweight modeling scaffold you can adapt (replace with your preferred engines):
-
-```{r model-scaffolds, eval=FALSE}
-# Example formulas (choose based on outcome distribution and design)
-
-# (A) LMM/GLMM with random intercept for practice and random treatment slope
-# Outcome is continuous (e.g., Y)
-library(lme4)
-m_maihda <- lmer(
-  Y ~ Z * (V1 + V2 + V3 + V4 + V5) + post + 
-    (1 + Z | id.practice),
+m_maihda_rs <- lme4::lmer(
+  Y ~ Z * (V1 + V2 + V3) + (1 + Z | id.practice),
   data = d
 )
-summary(m_maihda)
+summary(m_maihda_rs)
 
-# (B) Causal Forest sketch (grf) for ITEs (no random effects; cluster-robust SEs later)
-# Create design matrices
-library(grf)
-
-# Features (X) can include patient covariates + practice-year context
-X <- d %>% 
-  select(V1, V2, V3, V4, V5, starts_with("V"), starts_with("X"), n.patients, post) %>% 
-  as.matrix()
-
-W <- d$Z              # treatment
-Y_out <- d$Y          # outcome
-
-set.seed(1)
-cf <- causal_forest(X = X, Y = Y_out, W = W, clusters = d$id.practice)
-tau_hat <- predict(cf)$predictions
-
-# Attach ITEs back
-d$tau_hat <- tau_hat
-summary(d$tau_hat)
+# Extract SD of random slope for Z (heterogeneity across practices)
+vc <- VarCorr(m_maihda_rs)$id.practice
+sd_Z_slope <- sqrt(vc["Z","Z"])
+sd_Z_slope
 ```
 
-> For presentations/deliverables, you can compute ATE/CATEs, plot heterogeneity by intersections (e.g., combinations of `V1–V5`), and compare MAIHDA random slopes vs. CF CATE summaries.
+> **Interpretation.** The SD of the random slope for `Z` quantifies **how much the treatment effect varies across practices**. You can expand the fixed‑effect interactions (or add subgroup random effects) if needed.
 
-------------------------------------------------------------------------
+---
 
-## Appendix: Quick Data Dictionary Stubs
+# 6) Causal Forest (with clusters) for CATE/ITE
 
--   **Patient-level (`patient`)**: `id.patient`, `id.practice`, `V1–V5` (individual covariates).
--   **Patient-year (`patient_year`)**: `id.patient`, `year`, `Y` (patient outcome).
--   **Practice (`practice`)**: `id.practice`, `X1–X9` (practice covariates).
--   **Practice-year (`practice_year`)**: `id.practice`, `year`, `Z` (treatment), `post`, `n.patients`, aggregated `V*` (context), and a practice-level `Y` (drop for Track 1 outcome modeling).
+We estimate **individual treatment effects** while telling the forest about **practice clusters**.
 
-------------------------------------------------------------------------
+```{r causal-forest}
+# Build feature matrix X
+candidate_cols <- c("V1","V2","V3","V4","V5","post")
+candidate_cols <- intersect(candidate_cols, names(d))
+X <- d %>%
+  select(any_of(candidate_cols), starts_with("X")) %>%
+  mutate(across(everything(), ~ if(is.factor(.x)) as.numeric(.x) else .x)) %>%
+  as.matrix()
 
-*Edit the `params:` at the top or set `eval=TRUE` in code chunks when your data files are in place. If you want, I can tailor this to your exact column names (`_avg` vs `_C` suffixes) and add convenience functions (e.g., a `load_track1_replicate()` helper).*
+Y <- d$Y
+W <- d$Z
+clusters <- d$id.practice
+
+set.seed(1)
+cf <- grf::causal_forest(X = X, Y = Y, W = W, clusters = clusters, honesty = TRUE)
+
+# Predict ITEs and attach back
+d <- d %>% mutate(tau_hat = as.numeric(predict(cf)$predictions))
+
+summary(d$tau_hat)
+
+# Aggregate to intersectional strata for easy reporting
+cate_by_strata <- d %>%
+  group_by(strata) %>%
+  summarise(CATE = mean(tau_hat, na.rm=TRUE), n = n(), .groups="drop") %>%
+  arrange(desc(n))
+
+head(cate_by_strata, 12)
+
+# Diagnostics
+vi <- grf::variable_importance(cf)
+vi
+
+test_cal <- grf::test_calibration(cf)
+test_cal
+```
+
+**Notes.**
+- `variable_importance(cf)` shows which covariates help explain heterogeneity.  
+- `test_calibration(cf)` checks whether the predicted ITEs are well calibrated relative to observed differences.
+
+---
+
+# 7) One‑click “Results” mini‑report
+
+```{r results-mini-block}
+# ATE + 95% CI (cluster-robust)
+ate_hat <- as.numeric(coef(m_itt)["Z"])
+ate_ci  <- as.numeric(confint(m_itt, "Z", level = 0.95, cluster = ~ id.practice))
+
+# Strata VPC (illustrative: random intercepts for strata & practice)
+m_vpc <- lme4::lmer(Y ~ Z + (1|strata) + (1|id.practice), data = d)
+vc_vpc <- as.data.frame(VarCorr(m_vpc))
+v_strata <- vc_vpc$vcov[vc_vpc$grp=="strata"]
+v_prac   <- vc_vpc$vcov[vc_vpc$grp=="id.practice"]
+v_resid  <- vc_vpc$vcov[vc_vpc$grp=="Residual"]
+vpc_strata <- v_strata / (v_strata + v_prac + v_resid)
+
+# SD of treatment random slope (from section 5)
+sd_W_slope <- sd_Z_slope
+
+cat(sprintf(
+  "ATE (cluster-robust): %.3f  [95%% CI: %.3f, %.3f]\nStrata VPC: %.3f\nSD of treatment random slope (practice‑level): %.3f\n",
+  ate_hat, ate_ci[1], ate_ci[2], vpc_strata, sd_W_slope
+))
+```
+
+> This block gives you a **ready‑to‑quote** summary: ATE with cluster‑robust CI, the **intersectional share of variance (VPC)**, and the **heterogeneity magnitude** via the SD of the treatment random slope.
+
+---
+
+# 8) Handling self‑selection / opt‑out and doing diagnostics (Track 1 specific)
+
+Even in RCTs, we may see **non‑compliance**, **dropout**, or **selective intake**. Here is a **practical checklist** and code to run:
+
+### 8.1 Baseline balance (pre‑period, if available)
+```{r baseline-balance, eval=any(c("post" %in% names(d)))}
+if ("post" %in% names(d)) {
+  base <- d %>% filter(post == 0)
+  bal <- base %>%
+    group_by(Z) %>%
+    summarise(across(starts_with("V"), ~mean(.x, na.rm=TRUE)), .groups="drop") %>%
+    pivot_longer(-Z, names_to="var", values_to="mean") %>%
+    pivot_wider(names_from = Z, values_from = mean, names_prefix = "Z=") %>%
+    mutate(diff = `Z=1` - `Z=0`) %>% arrange(desc(abs(diff)))
+  bal %>% print(n=Inf)
+} else {
+  message("No `post` indicator found — baseline balance check skipped.")
+}
+```
+
+### 8.2 Overlap at the practice level (optional PS)
+If you have practice‑level covariates `X*`, you can model the *propensity* of treatment to check **overlap**.
+
+```{r practice-ps, eval=any(startsWith(names(d), "X"))}
+xcols <- names(d)[startsWith(names(d), "X")]
+if (length(xcols) > 0) {
+  # one row per practice
+  cluX <- d %>%
+    group_by(id.practice) %>%
+    summarise(Z = first(Z), across(all_of(xcols), ~mean(.x, na.rm=TRUE)), .groups="drop")
+  # simple logit PS
+  form <- reformulate(xcols, response = "Z")
+  m_ps <- glm(form, family = binomial(), data = cluX)
+  cluX$ps_hat <- predict(m_ps, type="response")
+  summary(m_ps)
+  ggplot(cluX, aes(ps_hat, fill=factor(Z))) +
+    geom_density(alpha=.4) +
+    labs(title="Practice-level propensity overlap (optional)", x="Estimated propensity", fill="Z")
+} else {
+  message("No practice-level X* covariates found — PS overlap skipped.")
+}
+```
+
+### 8.3 Cluster‑level permutation (randomization inference)
+We **permute Z at the practice level**, re‑estimate ATE many times, and locate the observed ATE in this null distribution.
+
+```{r permutation-ri, eval=TRUE}
+set.seed(2025)
+clu_vec <- unique(d$id.practice)
+Z_by_practice <- clu %>% select(id.practice, Z)
+
+perm_once <- function() {
+  Z_perm <- Z_by_practice %>% mutate(Zp = sample(Z))
+  d_perm <- d %>% left_join(Z_perm %>% select(id.practice, Zp), by="id.practice") %>%
+    mutate(Zp = as.integer(Zp))
+  coef(feols(Y ~ Zp, data = d_perm, cluster = ~ id.practice))["Zp"]
+}
+
+B <- 200  # increase if needed
+perm_ates <- replicate(B, perm_once())
+obs <- ate_hat
+p_right <- mean(perm_ates >= obs)
+p_left  <- mean(perm_ates <= obs)
+p_two   <- 2*min(p_right, p_left)
+
+tibble(
+  obs_ATE = obs,
+  perm_mean = mean(perm_ates),
+  perm_sd = sd(perm_ates),
+  p_two_sided = p_two
+) %>% print()
+```
+
+### 8.4 Missingness / opt‑out sensitivity (lightweight)
+Report baseline differences between **observed vs missing** (or dropouts if flagged). Add weights or imputations in sensitivity runs; be explicit in your write‑up.
+
+```{r missingness-light, eval=FALSE}
+# Example template if you have a missingness flag:
+# d %>% group_by(missing_flag) %>% summarise(across(starts_with("V"), ~mean(.x, na.rm=TRUE)))
+# Then re-run key models with weights or simple imputations and compare.
+```
+
+**Write‑up guidance (one paragraph).**  
+> We treat `Z` as an **assignment** indicator and report **ITT** as our primary effect. We verify **baseline balance** (pre‑period) and check **overlap** (when practice covariates `X*` exist). To guard against chance findings, we use **practice‑level randomization inference** (permutation). Potential **partial compliance** or **opt‑out** is discussed, with sensitivity analyses (weights/imputations) when relevant. In sum, identification arises from **between‑practice randomization**, and uncertainty accounts for **practice clustering**.
+
+---
+
+# 9) Appendix — quick visual summaries (optional)
+
+```{r visuals, eval=TRUE, fig.width=7, fig.height=4}
+# Practice means by Z
+ggplot(clu, aes(factor(Z), Y_bar)) +
+  geom_boxplot() + geom_jitter(width=.1, alpha=.4) +
+  labs(x="Z (practice assignment)", y="Practice mean of Y",
+       title="Practice-level outcome means by treatment assignment")
+```
+
+```{r cate-top-strata, eval=TRUE, fig.width=7, fig.height=4}
+if ("strata" %in% names(cate_by_strata)) {
+  topN <- cate_by_strata %>% slice_max(n, n = 15)
+  ggplot(topN, aes(reorder(strata, CATE), CATE)) +
+    geom_col() + coord_flip() +
+    labs(x="Strata", y="CATE (CF)",
+         title="Top strata by size — CF CATE") +
+    theme(axis.text.y = element_text(size=8))
+}
+```
