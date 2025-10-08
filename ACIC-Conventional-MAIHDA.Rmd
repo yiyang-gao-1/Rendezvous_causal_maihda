@@ -1,0 +1,663 @@
+---
+title: "Conventional MAIHDA — ACIC 2022 Track 1"
+author: "Yiyang Gao"
+date: "`r format(Sys.Date())`"
+output:
+  pdf_document:
+    latex_engine: xelatex
+    toc: true
+    toc_depth: 3
+    number_sections: true
+  html_document:
+    toc: true
+    toc_depth: 3
+    df_print: paged
+header-includes:
+  - \usepackage{booktabs}
+  - \usepackage{longtable}
+  - \usepackage{array}
+  - \usepackage[stretch=10]{microtype}
+---
+
+
+```{r setup, include=FALSE}
+# Turn off code echo in the knitted report 
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+
+# Load libraries
+suppressPackageStartupMessages({
+  library(data.table)    # fast file reading
+  library(dplyr)         # data manipulation verbs
+  library(tidyr)         # tidying helpers
+  library(forcats)       # factor tools
+  library(ggplot2)       # plotting
+  library(lme4)          # multilevel models
+  library(glue)          # string templating
+  library(broom.mixed)   # model tidiers
+  library(knitr)         # tables
+  library(stringr)       # string helpers
+})
+
+# Use sum-to-zero contrasts so fixed effects have a grand-mean interpretation
+options(contrasts = c("contr.sum", "contr.poly"))
+
+# A tiny helper used later to coalesce NULLs in a tidy way
+`%||%` <- function(a, b) if (!is.null(a)) a else b
+```
+
+# Load and merge ACIC Track 1
+
+```{r load-merge}
+# Choose a replicate (feel free to change this integer for other replicates)
+replicate_id_int <- 52L                                   # replicate number as integer
+replicate_id <- sprintf("%04d", replicate_id_int)         # pad to four digits, e.g., 0052
+
+# Base folder where the four ACIC subfolders live
+base_dir <- "/Users/constanceko/Desktop/MAIHDA/ACIC_track1a_20220404"
+
+# Build full file paths for the four core files for this replicate
+fp_patient_year  <- file.path(base_dir, "patient_year",  sprintf("acic_patient_year_%s.csv",  replicate_id))
+fp_patient       <- file.path(base_dir, "patient",       sprintf("acic_patient_%s.csv",       replicate_id))
+fp_practice      <- file.path(base_dir, "practice",      sprintf("acic_practice_%s.csv",      replicate_id))
+fp_practice_year <- file.path(base_dir, "practice_year", sprintf("acic_practice_year_%s.csv", replicate_id))
+
+# A small reader wrapper: check file exists, then fread, return data.frame (not data.table)
+rd <- function(p){
+  stopifnot(file.exists(p))                                # fail fast if file is missing
+  as.data.frame(fread(p, showProgress = TRUE))            # fast read then coerce
+}
+
+# Read the four files
+patient_year  <- rd(fp_patient_year)                      # patient-year outcome Y and year
+patient       <- rd(fp_patient)                           # patient-level V1–V5 and id.practice
+practice      <- rd(fp_practice)                          # practice-level X1–X9
+practice_year <- rd(fp_practice_year)                     # practice-year Z, post, n.patients, aggregates
+
+# Standardise key types (integers for ids and year)
+patient_year  <- mutate(patient_year,  id.patient = as.integer(id.patient), year = as.integer(year))
+patient       <- mutate(patient,       id.patient = as.integer(id.patient), id.practice = as.integer(id.practice))
+practice      <- mutate(practice,      id.practice = as.integer(id.practice))
+practice_year <- mutate(practice_year, id.practice = as.integer(id.practice), year = as.integer(year))
+
+# Track-1 outcome is the patient-year Y. If a practice-level Y exists in practice_year, drop it to avoid ambiguity
+if ("Y" %in% names(practice_year))
+  practice_year <- subset(practice_year, select = setdiff(names(practice_year), "Y"))
+
+# Merge to a star schema:
+#  — add patient covariates to patient-year
+#  — add practice covariates
+df <- patient_year %>%
+  inner_join(patient,  by = "id.patient") %>%             # adds V1–V5 and id.practice
+  left_join(practice,  by = "id.practice")                # adds X1–X9
+
+# Keep the common practice-year columns if present, then join by practice and year
+keep_cols <- intersect(
+  c("id.practice","year","Z","post","n.patients",
+    "V1_avg","V2_avg","V3_avg","V4_avg","V5_A_avg","V5_B_avg","V5_C_avg"),
+  names(practice_year)
+)
+
+df <- df %>%
+  left_join(practice_year[, keep_cols, drop = FALSE], by = c("id.practice","year")) %>%  # treatment and context
+  arrange(id.patient, year) %>%                                                          # tidy panel order
+  group_by(id.patient) %>%
+  mutate(Y_lag = dplyr::lag(Y)) %>%                                                      # an example lag (not used later)
+  ungroup() %>%
+  mutate(
+    # Exposure W equals one only in treated practices during the post period (practice-year assignment)
+    W           = as.integer(Z == 1 & post == 1),
+
+    # Treat ids and year as factors for random effects and fixed effects handling
+    year        = factor(year),
+    id.practice = factor(id.practice),
+    id.patient  = factor(id.patient)
+  )
+
+invisible(NULL)
+```
+
+# Recode to readable, teaching-friendly labels (strata inputs)
+
+```{r recodes}
+# A function that converts the abstract V1–V5 into labelled teaching factors
+label_patient_vars <- function(dat){
+  dat %>%
+    mutate(
+      # V1: risk score into quartiles, then label each quartile
+      V1_band = cut(
+        V1,
+        breaks = quantile(V1, probs = seq(0, 1, 0.25), na.rm = TRUE),
+        include.lowest = TRUE, dig.lab = 6
+      ),
+      V1_band = forcats::fct_recode(
+        V1_band,
+        "Risk: Low (Q1)"       = levels(V1_band)[1],
+        "Risk: Medium (Q2)"    = levels(V1_band)[2],
+        "Risk: High (Q3)"      = levels(V1_band)[3],
+        "Risk: Very High (Q4)" = levels(V1_band)[4]
+      ),
+
+      # V2: comorbidity into bands with readable labels
+      V2_band = case_when(
+        V2 <= 1          ~ "Comorbidity: 0–1",
+        V2 %in% 2:3      ~ "Comorbidity: 2–3",
+        V2 %in% 4:5      ~ "Comorbidity: 4–5",
+        V2 >= 6          ~ "Comorbidity: 6–7",
+        TRUE             ~ NA_character_
+      ) |> factor(),
+
+      # V3: sex/gender label
+      sex = factor(if_else(V3 == 1, "Female", "Male"),
+                   levels = c("Male","Female"),
+                   labels = c("Sex: Male","Sex: Female")),
+
+      # V4: deprivation index into tertiles with readable labels
+      V4_band = cut(
+        V4,
+        breaks = quantile(V4, probs = c(0, 1/3, 2/3, 1), na.rm = TRUE),
+        include.lowest = TRUE, dig.lab = 6
+      ),
+      V4_band = forcats::fct_recode(
+        V4_band,
+        "Deprivation: Low"  = levels(V4_band)[1],
+        "Deprivation: Mid"  = levels(V4_band)[2],
+        "Deprivation: High" = levels(V4_band)[3]
+      ),
+
+      # V5: insurance plan label
+      plan = forcats::fct_recode(factor(V5),
+                                 "Plan: A" = "A",
+                                 "Plan: B" = "B",
+                                 "Plan: C" = "C")
+    )
+}
+
+# Apply the labels to create readable factors
+df <- df %>% label_patient_vars()
+
+# Helper to drop any component that collapses to a single level in this replicate
+drop_single_level <- function(x) if (nlevels(droplevels(x)) <= 1) NULL else x
+
+# Collect the components that have at least two levels (keeps models estimable)
+components <- list(
+  sex     = drop_single_level(df$sex),
+  V1_band = drop_single_level(df$V1_band),
+  V2_band = drop_single_level(df$V2_band),
+  V4_band = drop_single_level(df$V4_band),
+  plan    = drop_single_level(df$plan)
+)
+
+# Names of the available components
+comp_names <- names(components)[!vapply(components, is.null, logical(1))]
+
+# Build the intersectional stratum factor from the available labelled components
+df <- df %>%
+  mutate(
+    strata_label = interaction(!!!components[comp_names], sep = " | ", drop = TRUE) |> forcats::fct_drop(),
+    stratum_id   = as.integer(strata_label)  # numeric id used in plots
+  )
+
+# A compact text label sometimes useful for figures
+df <- df %>%
+  mutate(
+    strata_short = glue::glue(
+      "{ifelse(sex=='Sex: Female','F','M')} | ",
+      "{forcats::fct_collapse(V1_band, Low='Risk: Low (Q1)', Med='Risk: Medium (Q2)', High=c('Risk: High (Q3)','Risk: Very High (Q4)'))} | ",
+      "{stringr::str_replace(as.character(V2_band), 'Comorbidity: ', 'C: ')} | ",
+      "{stringr::str_replace(as.character(V4_band), 'Deprivation: ', 'Dep: ')} | ",
+      "{stringr::str_replace(as.character(plan),     'Plan: ',        'P ')}"
+    )
+  )
+
+# The main additive fixed effects terms for Model A will mirror these components
+main_terms <- comp_names
+
+invisible(NULL)
+```
+
+# Descriptives
+
+```{r descriptives}
+# Table: observed stratum means with sizes
+obs <- df %>%
+  group_by(stratum_id, strata_label, sex, V2_band, plan, V1_band, V4_band) %>%
+  summarise(nj = n(), ybar_j = mean(Y, na.rm = TRUE), .groups = "drop") %>%
+  arrange(ybar_j)
+
+# Show the data frame structure (level-2 stratum id, level-1 id, response and covariates)
+peek <- df %>%
+  select(stratum_id, id.patient, Y, sex, V2_band, plan, V1_band, V4_band, year) %>%
+  slice_head(n = 8)
+
+knitr::kable(
+  peek,
+  format   = ifelse(knitr::is_latex_output(), "latex", "simple"),
+  booktabs = knitr::is_latex_output(),
+  caption  = "Data frame (excerpt): level-2 stratum id, level-1 id, response and level-2 covariates"
+)
+
+# Tables: top five and bottom five strata by observed mean Y
+bottom5 <- obs %>% slice_head(n = 5)  %>% mutate(rank = row_number())
+top5    <- obs %>% slice_tail(n = 5)  %>% mutate(rank = nrow(obs) - n() + row_number())
+
+fmt_tb <- function(x, ttl){
+  knitr::kable(
+    x %>% select(rank, stratum_id, sex, `comorbidity`=V2_band, plan, `risk`=V1_band, `deprivation`=V4_band, `size`=nj, `ȳj`=ybar_j),
+    format   = ifelse(knitr::is_latex_output(), "latex", "simple"),
+    booktabs = knitr::is_latex_output(),
+    caption  = ttl,
+    align    = "lllllllrr"
+  )
+}
+fmt_tb(top5,    "Observed stratum means — Top five")
+fmt_tb(bottom5, "Observed stratum means — Bottom five")
+
+# Plot: individuals and observed stratum means by stratum id
+stratum_means <- obs %>% select(stratum_id, ybar_j)
+ggplot() +
+  geom_point(data = df, aes(x = stratum_id, y = Y), alpha = 0.15, size = 0.7) +
+  geom_point(data = stratum_means, aes(x = stratum_id, y = ybar_j), size = 0.9) +
+  labs(title = "Individual Y and observed mean Y, by stratum",
+       x = "Stratum id", y = "Y") +
+  theme_minimal()
+
+# Plot: mean Y by each stratum characteristic (bars)
+char_means <- dplyr::bind_rows(
+  df %>% group_by(sex) %>%
+    summarise(var = "Sex",
+              level = as.character(first(sex)),
+              meanY = mean(Y, na.rm = TRUE),
+              .groups = "drop"),
+  df %>% group_by(V2_band) %>%
+    summarise(var = "Comorbidity",
+              level = as.character(first(V2_band)),
+              meanY = mean(Y, na.rm = TRUE),
+              .groups = "drop"),
+  df %>% group_by(plan) %>%
+    summarise(var = "Plan",
+              level = as.character(first(plan)),
+              meanY = mean(Y, na.rm = TRUE),
+              .groups = "drop"),
+  df %>% group_by(V1_band) %>%
+    summarise(var = "Risk",
+              level = as.character(first(V1_band)),
+              meanY = mean(Y, na.rm = TRUE),
+              .groups = "drop"),
+  df %>% group_by(V4_band) %>%
+    summarise(var = "Deprivation",
+              level = as.character(first(V4_band)),
+              meanY = mean(Y, na.rm = TRUE),
+              .groups = "drop")
+)
+
+overall_mean <- mean(df$Y, na.rm=TRUE)
+
+ggplot(char_means, aes(x = forcats::fct_reorder(level, meanY), y = meanY)) +
+  geom_col() +
+  geom_hline(yintercept = overall_mean, linetype = 3) +
+  facet_wrap(~ var, scales = "free_x") +
+  labs(title = "Mean Y by stratum characteristic",
+       x = NULL, y = "Mean Y") +
+  coord_flip() +
+  theme_minimal()
+
+# Plot: observed stratum mean against stratum size (with unweighted and weighted horizontal lines)
+unweighted_mean <- mean(obs$ybar_j)
+weighted_mean   <- with(obs, stats::weighted.mean(ybar_j, w = nj))
+
+ggplot(obs, aes(x = nj, y = ybar_j)) +
+  geom_point(alpha = 0.4) +
+  geom_hline(yintercept = unweighted_mean, linetype = 2) +
+  geom_hline(yintercept = weighted_mean,   linetype = 3) +
+  labs(title = "Observed stratum mean vs stratum size",
+       x = "Stratum size (n_j)", y = "Observed mean Y") +
+  theme_minimal()
+
+invisible(NULL)
+```
+
+# Tutorial *Empty* and *Full* models (with VPC and PCV)
+
+```{r empty-full}
+# Empty (null) MAIHDA: random intercepts for strata only
+m_empty <- lmer(Y ~ 1 + (1 | strata_label), data = df, REML = TRUE)
+
+# Full model: add main effects of the stratum characteristics, still with a strata random intercept
+main_part <- c("sex","V2_band","plan","V1_band","V4_band")
+f_full <- as.formula(paste0("Y ~ ", paste(main_part, collapse = " + "), " + (1 | strata_label)"))
+m_full <- lmer(f_full, data = df, REML = TRUE)
+
+# Extract between-stratum and residual variances for both models
+v_from <- function(fit, grp) {
+  vc <- as.data.frame(VarCorr(fit))
+  out <- vc$vcov[vc$grp==grp & vc$var1=="(Intercept)"]
+  if (length(out)==0) 0 else out[1]
+}
+var_u_empty <- v_from(m_empty, "strata_label")
+var_e_empty <- sigma(m_empty)^2
+var_u_full  <- v_from(m_full,  "strata_label")
+var_e_full  <- sigma(m_full)^2
+
+# VPC on the tutorial denominator (between strata divided by between strata plus residual)
+VPC_empty <- var_u_empty / (var_u_empty + var_e_empty)
+VPC_full  <- var_u_full  / (var_u_full  + var_e_full)
+
+# PCV: proportion change in between-stratum variance from empty to full
+PCV_full <- (var_u_empty - var_u_full) / var_u_empty
+
+# Present as a small table
+knitr::kable(
+  tibble::tibble(
+    model = c("Empty: 1 + (1 | strata)", "Full: main effects + (1 | strata)"),
+    VPC   = round(c(VPC_empty, VPC_full), 4),
+    `Between-stratum variance` = round(c(var_u_empty, var_u_full), 3),
+    `Residual variance`        = round(c(var_e_empty, var_e_full), 3)
+  ),
+  format   = ifelse(knitr::is_latex_output(), "latex", "simple"),
+  booktabs = knitr::is_latex_output(),
+  caption  = glue::glue("Tutorial-style VPC and variances; PCV (empty → full) = {round(100*PCV_full,1)}%")
+)
+
+invisible(NULL)
+```
+
+# MAIHDA (A → B → C)
+
+```{r models}
+
+# 1) Centre the exposure so the Model C intercept and slope are interpretable,
+#    and estimation is more stable numerically.
+df <- df %>% mutate(Wc = W - mean(W))
+
+# 2) Build the fixed–effect part for the models.
+#    If none of the labelled components survive (rare), use an intercept–only "1".
+fe_part <- if (length(main_terms)) paste(main_terms, collapse = " + ") else "1"
+
+# 3) Write the three models 
+#    Model A: additive fixed effects, random intercepts for practice and patient.
+fA <- as.formula(
+  paste0("Y ~ ", fe_part,
+         " + (1 | id.practice) + (1 | id.patient)")
+)
+
+#    Model B: add a strata random intercept (the MAIHDA layer).
+fB <- as.formula(
+  paste0("Y ~ ", fe_part,
+         " + (1 | id.practice) + (1 | id.patient) + (1 | strata_label)")
+)
+
+#    Model C (initial attempt): add centred exposure and allow its slope to vary by strata.
+#    Start with a correlated slope. We will detect singularity and adjust if needed.
+fC0 <- as.formula(
+  paste0("Y ~ Wc + ", fe_part,
+         " + (1 | id.practice) + (1 | id.patient) + (1 + Wc | strata_label)")
+)
+
+# 4) A small, reusable fitter with sensible defaults.
+#    - tries bobyqa with a generous iteration budget
+#    - optionally fits by ML first, then updates to REML (often calms tiny gradient messages)
+#    - can switch optimiser if needed
+fit_lmer <- function(formula, data, REML = TRUE, ml_then_reml = FALSE,
+                     optimizer = "bobyqa", maxfun = 2e5) {
+  ctrl <- lmerControl(optimizer = optimizer,
+                      optCtrl   = list(maxfun = maxfun),
+                      calc.derivs = TRUE)
+  if (ml_then_reml && REML) {
+    # Fit by ML first, then refit the optimum by REML (same random structure).
+    fit_ml  <- lmer(formula, data = data, REML = FALSE, control = ctrl)
+    fit_rem <- update(fit_ml, REML = TRUE)
+    return(fit_rem)
+  } else {
+    return(lmer(formula, data = data, REML = REML, control = ctrl))
+  }
+}
+
+# 5) Fit Model A.
+#    We use ML→REML because your gradient excess was only just above tolerance.
+mA <- fit_lmer(fA, df, REML = TRUE, ml_then_reml = TRUE)
+
+#    If you still see a very small gradient message, two safe numerical options are:
+#    (a) switch optimiser: mA <- fit_lmer(fA, df, REML = TRUE, ml_then_reml = TRUE, optimizer = "nloptwrap")
+mA <- fit_lmer(fA, df, REML = TRUE, ml_then_reml = TRUE, optimizer = "nloptwrap")
+#    (b) lightly rescale Y (e.g., Y_s = Y / sd(Y)) and fit the same RHS with Y_s on the LHS.
+
+# 6) Fit Model B 
+mB <- fit_lmer(fB, df, REML = TRUE)
+
+# 7) Fit Model C with automatic structure repair if singular.
+#    Start with correlated slope (fC0). If singular:
+#      - first try uncorrelated slope (keep both variances, drop covariance): (1 + Wc || strata_label)
+#      - if the strata intercept variance is ~0 but slope is >0, use a slope–only term: (0 + Wc | strata_label)
+mC <- fit_lmer(fC0, df, REML = TRUE)
+
+if (lme4::isSingular(mC, tol = 1e-5)) {
+  # Uncorrelated random effects for strata (keeps both variances if identifiable)
+  fC_uncor <- as.formula(
+    paste0("Y ~ Wc + ", fe_part,
+           " + (1 | id.practice) + (1 | id.patient) + (1 + Wc || strata_label)")
+  )
+  mC <- fit_lmer(fC_uncor, df, REML = TRUE)
+
+  if (lme4::isSingular(mC, tol = 1e-5)) {
+    # Inspect variances to decide whether to drop the strata intercept.
+    vcC <- as.data.frame(VarCorr(mC))
+    v_strata_int <- vcC$vcov[vcC$grp == "strata_label" & vcC$var1 == "(Intercept)"]
+    v_strata_slo <- vcC$vcov[vcC$grp == "strata_label" & vcC$var1 == "Wc"]
+
+    if (!length(v_strata_int)) v_strata_int <- 0
+    if (!length(v_strata_slo)) v_strata_slo <- 0
+
+    # If the intercept variance is effectively zero but the slope variance is not,
+    # use a slope–only term for strata.
+    if (is.finite(v_strata_int) && is.finite(v_strata_slo) &&
+        v_strata_int < 1e-8 && v_strata_slo > 0) {
+      fC_slope_only <- as.formula(
+        paste0("Y ~ Wc + ", fe_part,
+               " + (1 | id.practice) + (1 | id.patient) + (0 + Wc | strata_label)")
+      )
+      mC <- fit_lmer(fC_slope_only, df, REML = TRUE)
+    }
+  }
+}
+
+
+invisible(NULL)
+
+
+```
+
+# VPC for Model B and slope heterogeneity for Model C
+
+```{r vpc}
+# Extract variance components from Model B
+vcB_df <- as.data.frame(VarCorr(mB))
+
+get_vc <- function(vdf, group, var1, var2 = NA) {
+  out <- vdf$vcov[vdf$grp == group & vdf$var1 == var1 &
+                    (is.na(vdf$var2) == is.na(var2)) &
+                    ((vdf$var2 %||% NA) == (var2 %||% NA))]
+  if (length(out) == 0) 0 else out[1]
+}
+
+v_strata_B <- get_vc(vcB_df, "strata_label", "(Intercept)")  # between-stratum variance
+v_practice <- get_vc(vcB_df, "id.practice",  "(Intercept)")  # practice variance
+v_patient  <- get_vc(vcB_df, "id.patient",   "(Intercept)")  # patient variance
+v_resid_B  <- tryCatch(as.numeric(sigma(mB))^2, error = function(e) NA_real_)  # residual variance
+
+# VPC that includes all random components in the denominator
+V_total_B     <- sum(v_strata_B, v_practice, v_patient, v_resid_B, na.rm = TRUE)
+VPC_strata_B  <- if (is.finite(V_total_B) && V_total_B > 0) v_strata_B / V_total_B else NA_real_
+
+# VPC using only strata and residual in the denominator (for comparison)
+VPC_strata_canonical <- if (is.finite(v_strata_B) && is.finite(v_resid_B) &&
+                             (v_strata_B + v_resid_B) > 0) {
+  v_strata_B / (v_strata_B + v_resid_B)
+} else NA_real_
+
+# From Model C: standard deviation of the Wc random slope and the intercept–slope correlation
+vcC_df <- as.data.frame(VarCorr(mC))
+sd_W   <- sqrt(get_vc(vcC_df, "strata_label", "Wc"))
+sd_int <- sqrt(get_vc(vcC_df, "strata_label", "(Intercept)"))
+cov_iw <- vcC_df$vcov[vcC_df$grp=="strata_label" & vcC_df$var1=="(Intercept)" & vcC_df$var2=="Wc"]
+cov_iw <- if (length(cov_iw)) cov_iw[1] else NA_real_
+corr_iw <- if (is.finite(sd_W) && is.finite(sd_int) && sd_W>0 && sd_int>0) cov_iw/(sd_W*sd_int) else NA_real_
+
+# Report the two VPCs for clarity
+knitr::kable(
+  tibble::tibble(
+    quantity = c("VPC (canonical, strata and residual only)", "VPC (design-faithful, all random parts)"),
+    value    = round(c(VPC_strata_canonical, VPC_strata_B), 4)
+  ),
+  format   = ifelse(knitr::is_latex_output(), "latex", "simple"),
+  booktabs = knitr::is_latex_output(),
+  caption  = "Variance Partition Coefficients for Model B"
+)
+
+invisible(NULL)
+```
+
+# Caterpillars (random intercepts and random slopes)
+
+```{r caterpillars, fig.width=7, fig.height=5}
+# Caterpillar for strata random intercepts from Model B (with conditional standard errors)
+rr <- lme4::ranef(mB, condVar = TRUE)
+re  <- rr$strata_label
+pv  <- attr(rr$strata_label, "postVar")              # 1 x 1 x J array of posterior variances
+se  <- sqrt(sapply(1:dim(pv)[3], function(j) pv[,,j]))
+ciL <- re[,"(Intercept)"] - 1.96*se
+ciU <- re[,"(Intercept)"] + 1.96*se
+
+cat_df <- tibble::tibble(
+  stratum = rownames(re),
+  effect  = re[,"(Intercept)"],
+  ciL = ciL, ciU = ciU
+) %>% arrange(effect) %>% mutate(idx = row_number())
+
+ggplot(cat_df, aes(x = idx, y = effect)) +
+  geom_hline(yintercept = 0, linetype = 3) +
+  geom_errorbar(aes(ymin = ciL, ymax = ciU), width = 0) +
+  geom_point(size = 0.7) +
+  labs(title = "Caterpillar: strata random intercepts (Model B)",
+       x = "Strata (ordered)", y = "BLUP (centred on overall mean)") +
+  theme_minimal()
+
+# Caterpillar for the Wc slope from Model C (if estimated)
+rrC <- lme4::ranef(mC, condVar = TRUE)
+reC <- rrC$strata_label
+if (!is.null(reC) && any(colnames(reC) == "Wc")) {
+  pvC  <- attr(rrC$strata_label, "postVar")
+  w_idx <- which(colnames(reC)=="Wc")
+  seW <- sqrt(sapply(1:dim(pvC)[3], function(j) pvC[w_idx,w_idx,j]))
+  ciLW <- reC[,"Wc"] - 1.96*seW
+  ciUW <- reC[,"Wc"] + 1.96*seW
+
+  catW <- tibble::tibble(
+    stratum = rownames(reC),
+    slope   = reC[,"Wc"],
+    ciL = ciLW, ciU = ciUW
+  ) %>% arrange(slope) %>% mutate(idx = row_number())
+
+  ggplot(catW, aes(x = idx, y = slope)) +
+    geom_hline(yintercept = 0, linetype = 3) +
+    geom_errorbar(aes(ymin = ciL, ymax = ciU), width = 0) +
+    geom_point(size = 0.7) +
+    labs(title = "Caterpillar: strata random slope for Wc (Model C)",
+         x = "Strata (ordered)", y = "Deviation from overall Wc effect") +
+    theme_minimal()
+}
+invisible(NULL)
+```
+
+# Results 
+
+```{r results}
+# Pull the centred treatment effect from Model C and its uncertainty
+coefs <- broom.mixed::tidy(mC, effects = "fixed")
+ATE_Wc <- coefs$estimate[coefs$term == "Wc"]
+SE_Wc  <- coefs$std.error[coefs$term == "Wc"]
+t_Wc   <- coefs$statistic[coefs$term == "Wc"]
+
+cat(glue::glue("
+**Automatic summary**  
+- Fixed effect of centred W (Model C): {round(ATE_Wc, 2)} (SE {round(SE_Wc, 2)}, t = {round(t_Wc, 2)})  
+- Strata VPC (canonical): {round(VPC_strata_canonical, 4)}  
+- Strata VPC (design-faithful): {round(VPC_strata_B, 4)}  
+- Standard deviation of the Wc random slope (Model C): {round(sd_W, 2)}  
+- Correlation between strata intercept and Wc slope: {round(corr_iw, 2)}
+"))
+```
+
+```{r interpretation, results='asis'}
+# A simple interval showing how much stratum-specific slopes vary around the mean
+low  <- ATE_Wc - 2*sd_W
+high <- ATE_Wc + 2*sd_W
+
+vpc_phrase <- ifelse(is.na(VPC_strata_canonical), "not available",
+                     ifelse(VPC_strata_canonical < .02, "very small",
+                            ifelse(VPC_strata_canonical < .05, "modest", "substantial")))
+
+corr_dir <- ifelse(is.na(corr_iw), "unclear",
+                   ifelse(corr_iw < 0, "lower-baseline strata tend to benefit more",
+                          "higher-baseline strata tend to benefit more"))
+
+cat(glue::glue("
+**Interpretation (reader-friendly):**  
+On average, exposure in treated post-periods (centred W) is associated with a change of about **{round(ATE_Wc,0)}** units (SE {round(SE_Wc,1)}).  
+Baseline differences between intersectional strata are **{vpc_phrase}** on the tutorial scale (VPC ≈ {round(100*VPC_strata_canonical,1)}%).  
+Treatment effects **vary across strata**: the random-slope standard deviation is about **{round(sd_W,1)}**, so many strata lie roughly between **{round(low,0)}** and **{round(high,0)}** around the average effect.  
+The intercept–slope correlation (≈ {round(corr_iw,2)}) suggests **{corr_dir}**.
+"))
+```
+
+# Top fifteen strata by size
+
+```{r strata-top15}
+# Summarise readable strata and present the top fifteen by patient-year count
+strata_top15 <- df %>%
+  group_by(strata_label) %>%
+  summarise(
+    n          = n(),
+    patients   = n_distinct(id.patient),
+    practices  = n_distinct(id.practice),
+    mean_Y     = mean(Y, na.rm = TRUE),
+    W_rate     = mean(W, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(n)) %>%
+  slice_head(n = 15) %>%
+  mutate(
+    `Mean Y` = round(mean_Y, 2),
+    `W rate` = scales::percent(W_rate, accuracy = 0.1)
+  ) %>%
+  select(`Strata (readable)` = strata_label, n, patients, practices, `Mean Y`, `W rate`)
+
+knitr::kable(
+  strata_top15,
+  format   = ifelse(knitr::is_latex_output(), "latex", "simple"),
+  booktabs = knitr::is_latex_output(),
+  align    = "lrrrrl",
+  caption  = "Top fifteen intersectional strata by number of patient-year observations (with mean outcome and exposure rate)."
+)
+
+# Optional bar chart for the same table
+plot_df <- strata_top15 %>%
+  mutate(label = forcats::fct_reorder(`Strata (readable)`, n))
+
+ggplot(plot_df, aes(x = label, y = n)) +
+  geom_col() +
+  coord_flip() +
+  labs(
+    title = "Top fifteen strata by size",
+    x = NULL, y = "Patient-year observations"
+  ) +
+  theme_minimal()
+
+invisible(NULL)
+```
+
+# Notes
+
+* The **tutorial pair** (*Empty* and *Full*) reproduces the sequence from the videos and yields **VPC** and **PCV** exactly as taught.
+* The **MAIHDA** keeps practice and patient random intercepts and adds a **random slope of centred W** by strata to study treatment-effect heterogeneity.
+* Two **VPCs** are reported: the **canonical** (following George's Youtube tutorials) and the one including all random components.
+* Caterpillars show **shrinkage** of stratum means and the distribution of **stratum-specific treatment slopes**.
