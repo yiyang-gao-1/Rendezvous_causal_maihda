@@ -1,4 +1,4 @@
-# 🔬 Rendezvous: Causal-MAIHDA Analysis Pipeline
+# 🔬 Causal-MAIHDA Analysis Pipeline
 
 ## 📋 Overview
 
