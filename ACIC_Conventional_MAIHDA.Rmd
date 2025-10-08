@@ -42,16 +42,25 @@ suppressPackageStartupMessages({
 # Use sum-to-zero contrasts so fixed effects have a grand-mean interpretation
 options(contrasts = c("contr.sum", "contr.poly"))
 
-# A tiny helper used later to coalesce NULLs in a tidy way
-`%||%` <- function(a, b) if (!is.null(a)) a else b
 ```
 
 # Load and merge ACIC Track 1
 
+## Aim of this session
+
+- **Intersectional strata formation**
+  - Created by crossing: sex × risk × comorbidity × deprivation × plan
+  
+- **Between-stratum variation quantification**
+  - Measured using VPC (Variance Partition Coefficient)
+  
+- **Treatment heterogeneity modeling**
+  - Implemented through random slope of Wc
+
 ```{r load-merge}
 # Choose a replicate (feel free to change this integer for other replicates)
-replicate_id_int <- 52L                                   # replicate number as integer
-replicate_id <- sprintf("%04d", replicate_id_int)         # pad to four digits, e.g., 0052
+replicate_id_int <- 52                                   # replicate number as integer
+replicate_id <- sprintf("%04d", replicate_id_int)        # pad to four digits, e.g., 0052
 
 # Base folder where the four ACIC subfolders live
 base_dir <- "/Users/constanceko/Desktop/MAIHDA/ACIC_track1a_20220404"
@@ -64,7 +73,7 @@ fp_practice_year <- file.path(base_dir, "practice_year", sprintf("acic_practice_
 
 # A small reader wrapper: check file exists, then fread, return data.frame (not data.table)
 rd <- function(p){
-  stopifnot(file.exists(p))                                # fail fast if file is missing
+  stopifnot(file.exists(p))                               # fail fast if file is missing
   as.data.frame(fread(p, showProgress = TRUE))            # fast read then coerce
 }
 
@@ -114,7 +123,8 @@ df <- df %>%
     id.patient  = factor(id.patient)
   )
 
-invisible(NULL)
+head(df)
+
 ```
 
 # Recode to readable, teaching-friendly labels (strata inputs)
@@ -210,10 +220,12 @@ df <- df %>%
     )
   )
 
+
+
 # The main additive fixed effects terms for Model A will mirror these components
 main_terms <- comp_names
 
-invisible(NULL)
+
 ```
 
 # Descriptives
@@ -225,6 +237,7 @@ obs <- df %>%
   summarise(nj = n(), ybar_j = mean(Y, na.rm = TRUE), .groups = "drop") %>%
   arrange(ybar_j)
 
+head(obs)
 # Show the data frame structure (level-2 stratum id, level-1 id, response and covariates)
 peek <- df %>%
   select(stratum_id, id.patient, Y, sex, V2_band, plan, V1_band, V4_band, year) %>%
@@ -314,7 +327,7 @@ ggplot(obs, aes(x = nj, y = ybar_j)) +
        x = "Stratum size (n_j)", y = "Observed mean Y") +
   theme_minimal()
 
-invisible(NULL)
+
 ```
 
 # Tutorial *Empty* and *Full* models (with VPC and PCV)
@@ -359,7 +372,7 @@ knitr::kable(
   caption  = glue::glue("Tutorial-style VPC and variances; PCV (empty → full) = {round(100*PCV_full,1)}%")
 )
 
-invisible(NULL)
+
 ```
 
 # MAIHDA (A → B → C)
@@ -431,6 +444,7 @@ mB <- fit_lmer(fB, df, REML = TRUE)
 #      - if the strata intercept variance is ~0 but slope is >0, use a slope–only term: (0 + Wc | strata_label)
 mC <- fit_lmer(fC0, df, REML = TRUE)
 
+# if receiving warning messages about "isSingular"
 if (lme4::isSingular(mC, tol = 1e-5)) {
   # Uncorrelated random effects for strata (keeps both variances if identifiable)
   fC_uncor <- as.formula(
@@ -462,7 +476,7 @@ if (lme4::isSingular(mC, tol = 1e-5)) {
 }
 
 
-invisible(NULL)
+
 
 
 ```
@@ -515,8 +529,8 @@ corr_iw <- if (is.finite(sd_W) && is.finite(sd_int) && sd_W > 0 && sd_int > 0) {
 # Report
 knitr::kable(
   tibble::tibble(
-    quantity = c("VPC (canonical, strata and residual only)",
-                 "VPC (design-faithful, all random parts)"),
+    quantity = c("VPC (strata and residual only)",
+                 "VPC (all random parts)"),
     value    = round(c(VPC_strata_canonical, VPC_strata_B), 4)
   ),
   format   = ifelse(knitr::is_latex_output(), "latex", "simple"),
@@ -524,7 +538,7 @@ knitr::kable(
   caption  = "Variance Partition Coefficients for Model B"
 )
 
-invisible(NULL)
+
 
 ```
 
@@ -624,7 +638,7 @@ if (has_strata) {
   cat("Note: Model C random effects for strata not available; skipped.\n")
 }
 
-invisible(NULL)
+
 
 
 ```
@@ -713,7 +727,7 @@ ggplot(plot_df, aes(x = label, y = n)) +
   ) +
   theme_minimal()
 
-invisible(NULL)
+
 ```
 
 # Notes

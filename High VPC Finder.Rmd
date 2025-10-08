@@ -1,0 +1,152 @@
+---
+title: "High VPC Finder — Loop through ACIC 2022 Track 1"
+author: "Yiyang Gao"
+date: "`r format(Sys.Date())`"
+output:
+  pdf_document:
+    latex_engine: xelatex
+    toc: true
+    toc_depth: 3
+    number_sections: true
+  html_document:
+    toc: true
+    toc_depth: 3
+    df_print: paged
+header-includes:
+  - \usepackage{booktabs}
+  - \usepackage{longtable}
+  - \usepackage{array}
+  - \microtypesetup{stretch=10}
+
+---
+
+A helper chunk that loops over a small set of replicates, fits the Empty/Full pair, and prints a table of VPCs so we can pick a high-VPC example.
+
+```{r screen_replicates_for_vpc, message=FALSE, warning=FALSE}
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(lme4)
+  library(glue)
+  library(purrr)
+  library(tibble)
+})
+
+# --- 0) Config ---------------------------------------------------------------
+# Use your existing param, or set a literal path here:
+base_dir <- "/Users/constanceko/Desktop/MAIHDA/ACIC_track1a_20220404"
+
+# Pick a small set to screen (include "0052" for reference):
+replicates <- c("0052", "0007", "0113", "0294", "0371")
+
+# --- 1) A loader you can swap out -------------------------------------------
+# Replace the body of load_acic_track1() with your own merge function if you already have it.
+load_acic_track1 <- function(repl_id, base = data_dir) {
+  # Try a few common possibilities; replace with your known-good merge
+  # MUST return a data.frame with Y, sex, risk, comorbidity, deprivation, plan
+  # Optionally: stratum_id (if not, we create it)
+  
+  # Example 1: pre-merged RDS per replicate (fast path)
+  rds1 <- file.path(base, glue("merged_track1_{repl_id}.rds"))
+  if (file.exists(rds1)) return(readRDS(rds1))
+  
+  # Example 2: a single CSV per replicate
+  csv1 <- file.path(base, glue("merged_track1_{repl_id}.csv"))
+  if (file.exists(csv1)) return(read.csv(csv1))
+  
+  # Example 3: your custom merge function (uncomment if available)
+  # return(my_merge_track1(repl_id, base))
+  
+  stop(glue("No known data file found for replicate {repl_id} in {base}. 
+  Please point load_acic_track1() to your merge routine or a merged file."))
+}
+
+# --- 2) Helpers to compute VPC/PCV ------------------------------------------
+get_vparts <- function(mod) {
+  vc <- VarCorr(mod)
+  # Random intercept variance for 'stratum'
+  # Try both 'stratum' and 'stratum_id' in case of different naming:
+  rn <- names(vc)
+  cl <- if ("stratum" %in% rn) "stratum" else if ("stratum_id" %in% rn) "stratum_id" else rn[1]
+  between <- as.numeric(vc[[cl]][1])
+  resid   <- attr(vc, "sc")^2
+  tibble(between = between, resid = resid, vpc = between / (between + resid))
+}
+
+fit_pair <- function(df) {
+  # Ensure stratum_id exists
+  if (!"stratum_id" %in% names(df)) {
+    df <- df %>%
+      mutate(
+        across(c(sex, risk, comorbidity, deprivation, plan), ~ as.factor(.x)),
+        stratum_id = interaction(sex, risk, comorbidity, deprivation, plan, drop = TRUE)
+      )
+  } else {
+    df <- df %>% mutate(stratum_id = as.factor(stratum_id))
+  }
+  
+  # Basic sanity filter
+  df <- df %>%
+    filter(!is.na(Y)) %>%
+    drop_na(sex, risk, comorbidity, deprivation, plan)
+  
+  # Empty & Full
+  m_empty <- lmer(Y ~ 1 + (1 | stratum_id), data = df, REML = TRUE,
+                  control = lmerControl(optimizer = "bobyqa"))
+  m_full  <- lmer(Y ~ sex + risk + comorbidity + deprivation + plan + (1 | stratum_id),
+                  data = df, REML = TRUE, control = lmerControl(optimizer = "bobyqa"))
+  
+  ve <- get_vparts(m_empty)
+  vf <- get_vparts(m_full)
+  pcv <- (ve$between - vf$between) / ve$between
+  
+  tibble(
+    vpc_empty  = ve$vpc,
+    vpc_full   = vf$vpc,
+    between_empty = ve$between,
+    between_full  = vf$between,
+    resid_full    = vf$resid,
+    pcv_empty_to_full = pcv
+  )
+}
+
+# --- 3) Loop over replicates safely -----------------------------------------
+results <- map_dfr(
+  replicates,
+  function(rid) {
+    out <- try({
+      df <- load_acic_track1(rid, data_dir)
+      pair <- fit_pair(df)
+      pair %>% mutate(replicate = rid, .before = 1)
+    }, silent = TRUE)
+    if (inherits(out, "try-error")) {
+      tibble(
+        replicate = rid,
+        vpc_empty = NA_real_,
+        vpc_full = NA_real_,
+        between_empty = NA_real_,
+        between_full = NA_real_,
+        resid_full = NA_real_,
+        pcv_empty_to_full = NA_real_,
+        note = as.character(out)
+      )
+    } else {
+      out %>% mutate(note = NA_character_)
+    }
+  }
+)
+
+# --- 4) Present a clean, sorted summary -------------------------------------
+results %>%
+  arrange(desc(vpc_full)) %>%
+  mutate(
+    vpc_empty = round(vpc_empty, 4),
+    vpc_full  = round(vpc_full, 4),
+    pcv_empty_to_full = round(pcv_empty_to_full, 3),
+    between_empty = round(between_empty, 1),
+    between_full  = round(between_full, 1),
+    resid_full    = round(resid_full, 1)
+  ) %>%
+  select(replicate, vpc_empty, vpc_full, pcv_empty_to_full,
+         between_empty, between_full, resid_full, note) %>%
+  knitr::kable(caption = "Screened replicates: VPCs (Empty vs Full) and PCV. Pick a high VPC_full.")
